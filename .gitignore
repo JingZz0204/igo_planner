@@ -14,5 +14,8 @@ gmm_nva_path_planner/
 SIMPL-main/
 *.png
 *.gif
+!docs/
+!docs/assets/
+!docs/assets/*.gif
 *.html
 .DS_Store

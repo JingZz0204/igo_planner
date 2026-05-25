@@ -57,6 +57,17 @@ common              负责共享数据结构
 
 其中 `trajectory_certificate_score` 是轨迹级非马尔可夫 cost 的统一入口，目前已经实现 terminal value，后续可继续扩展 occupation-style feature 和 certificate slack。
 
+## 可视化效果
+
+以下 GIF 使用 `static_nudge`、`lane_change` 两个场景，以及 `lattice_trajectory`、`bezier_trajectory` 两种参数化模式生成，用于快速观察规划器在静态绕行和换道任务中的轨迹行为。
+
+| 场景 | 轨迹模型 | 可视化 |
+| --- | --- | --- |
+| `static_nudge` | `lattice_trajectory` | ![static_nudge lattice](docs/assets/static_nudge_lattice.gif) |
+| `lane_change` | `lattice_trajectory` | ![lane_change lattice](docs/assets/lane_change_lattice.gif) |
+| `static_nudge` | `bezier_trajectory` | ![static_nudge bezier](docs/assets/static_nudge_bezier.gif) |
+| `lane_change` | `bezier_trajectory` | ![lane_change bezier](docs/assets/lane_change_bezier.gif) |
+
 ## 安装
 
 建议使用 Python 3.9 或更高版本。
@@ -568,6 +579,7 @@ spatiotemporal_joint_planner/demo.py
 ```text
 --scenario                         static_nudge / lane_change
 --trajectory-model                 lattice_trajectory / bezier_trajectory
+--objective-mode                   auto / vectorized / scalar
 --max-steps                        仿真步数
 --planning-dt                      每帧执行时间
 --horizon                          规划时域
@@ -612,7 +624,7 @@ ts         terminal speed score
 - 目前主要实现参数化 planner，非参数化 SVGD planner 仍在预留阶段。
 - `lattice_trajectory` 目前参数维度较低，只包含 `l_end` 与 `v_end`。
 - `trajectory-level certificate cost` 目前只实现 terminal value，occupation-style feature 和 certificate slack 仍是空实现。
-- cost 还没有完整 batch/vectorized 版本，CMA-ES 样本评估目前仍是逐样本 evaluate。
+- batch/vectorized 样本评估已经支持 `lattice_trajectory` 和 `bezier_trajectory`，但参考线投影仍是主要性能瓶颈。
 - 动态障碍物交互 cost 尚未完整实现。
 
 ## 后续计划
@@ -622,7 +634,7 @@ ts         terminal speed score
 - 为 `lattice_trajectory` 增加更强的中间形态表达能力。
 - 实现 occupation-style trajectory feature。
 - 实现 certificate slack cost。
-- 增加 NumPy batch evaluate，提高 CMA-ES 样本评估速度。
+- 优化参考线投影、candidate 解码和 batch decode 性能。
 - 实现真正的 SVGD 非参数化粒子轨迹优化。
 - 增加动态障碍物场景和交互 cost。
 - 增加单元测试和 benchmark 场景。
