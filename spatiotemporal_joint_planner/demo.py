@@ -177,6 +177,7 @@ def _build_planner(args, trajectory_model) -> ParametricPlanner:
             candidate_limit=args.mode_paths,
             warm_start=not args.no_warm_start,
             max_initial_anchors=args.max_initial_anchors,
+            objective_mode=args.objective_mode,
         ),
     )
 
@@ -579,6 +580,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-initial-anchors", type=int, default=96)
     parser.add_argument("--mode-paths", type=int, default=8)
+    parser.add_argument("--objective-mode", choices=["auto", "vectorized", "scalar"], default="auto")
     parser.add_argument("--no-warm-start", action="store_true")
     parser.add_argument("--save-frame", type=str, default=None)
     parser.add_argument("--save-mp4", type=str, default=None)

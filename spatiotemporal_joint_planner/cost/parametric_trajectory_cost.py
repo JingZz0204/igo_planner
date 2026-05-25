@@ -321,6 +321,603 @@ class ParametricTrajectoryCost(CostFunction):
         terms.update(self._reference_lateral_running_terms(trajectory, problem, blocked_ranges))
         return terms
 
+    def evaluate_lattice_batch(self, trajectory_batch: dict, problem: PlanningProblem) -> np.ndarray:
+        """Vectorized total-cost evaluation for lattice_trajectory batches."""
+
+        return self.evaluate_batch(trajectory_batch, problem)
+
+    def evaluate_bezier_batch(self, trajectory_batch: dict, problem: PlanningProblem) -> np.ndarray:
+        """Vectorized total-cost evaluation for bezier_trajectory batches."""
+
+        return self.evaluate_batch(trajectory_batch, problem)
+
+    def evaluate_batch(self, trajectory_batch: dict, problem: PlanningProblem) -> np.ndarray:
+        """Vectorized total-cost evaluation for trajectory array batches."""
+
+        blocked_ranges = self._blocked_ranges(problem)
+        terms = self._lattice_batch_running_terms(trajectory_batch, problem, blocked_ranges)
+        scores = self._lattice_batch_hierarchy_scores(terms)
+        certificate_score = self._lattice_batch_certificate_score(trajectory_batch, problem, blocked_ranges)
+
+        collision_score = self._saturate_array(scores["collision_cost"], self.config.collision_score_scale)
+        road_score = self._saturate_array(scores["road_cost"], self.config.road_score_scale)
+        hard_hierarchy_cost = (
+            1.0e9 * collision_score
+            + 1.0e8 * road_score
+            + 1.0e7 * scores["kappa_hard_score"]
+            + 1.0e6 * scores["dkappa_hard_score"]
+            + 1.0e5 * scores["lateral_accel_hard_score"]
+            + 1.0e4 * scores["lateral_jerk_hard_score"]
+        )
+        soft_hierarchy_cost = (
+            1.0e3 * scores["efficiency_score"]
+            + 1.0e2 * scores["comfort_score"]
+            + 1.0e1 * scores["reference_score"]
+        )
+        if bool(self.config.trajectory_certificate_enabled):
+            soft_hierarchy_cost = (
+                1.0e3 * scores["efficiency_score"]
+                + 1.0e2 * certificate_score
+                + 1.0e1 * scores["comfort_score"]
+                + 1.0e0 * scores["reference_score"]
+            )
+        total = np.asarray(hard_hierarchy_cost + soft_hierarchy_cost, dtype=float)
+        total[~np.isfinite(total)] = float("inf")
+        return total
+
+    def _lattice_batch_running_terms(
+        self,
+        trajectory_batch: dict,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
+        s = np.asarray(trajectory_batch["s"], dtype=float)
+        l = np.asarray(trajectory_batch["l"], dtype=float)
+        t = np.asarray(trajectory_batch["t"], dtype=float)
+        s_v = np.asarray(trajectory_batch.get("s_v"), dtype=float)
+        l_a = np.asarray(trajectory_batch.get("l_a"), dtype=float)
+        kappa = trajectory_batch.get("kappa")
+        if kappa is None:
+            kappa_values = np.zeros_like(s, dtype=float)
+        else:
+            kappa_values = np.asarray(kappa, dtype=float)
+        dkappa = self._batch_dkappa_values(trajectory_batch, kappa_values)
+        lateral_jerk = self._batch_gradient(l_a, t)
+
+        terms = {}
+        terms.update(self._lattice_batch_collision_terms(s, l, blocked_ranges))
+        terms.update(self._lattice_batch_road_terms(l, problem))
+        terms.update(
+            self._lattice_batch_bounded_zero_terms(
+                "lateral_accel",
+                l_a,
+                min_value=float(self.config.min_lateral_accel),
+                max_value=float(self.config.max_lateral_accel),
+                zero_comfort=float(self.config.lateral_accel_zero_comfort),
+                zero_weight=float(self.config.lateral_accel_zero_weight),
+            )
+        )
+        terms.update(
+            self._lattice_batch_bounded_zero_terms(
+                "kappa",
+                kappa_values,
+                min_value=float(self.config.min_kappa),
+                max_value=float(self.config.max_kappa),
+                zero_comfort=float(self.config.kappa_zero_comfort),
+                zero_weight=float(self.config.kappa_zero_weight),
+            )
+        )
+        terms.update(
+            self._lattice_batch_bounded_zero_terms(
+                "dkappa",
+                dkappa,
+                min_value=float(self.config.min_dkappa),
+                max_value=float(self.config.max_dkappa),
+                zero_comfort=float(self.config.dkappa_zero_comfort),
+                zero_weight=float(self.config.dkappa_zero_weight),
+            )
+        )
+        terms.update(
+            self._lattice_batch_bounded_zero_terms(
+                "lateral_jerk",
+                lateral_jerk,
+                min_value=float(self.config.min_lateral_jerk),
+                max_value=float(self.config.max_lateral_jerk),
+                zero_comfort=float(self.config.lateral_jerk_zero_comfort),
+                zero_weight=float(self.config.lateral_jerk_zero_weight),
+            )
+        )
+        terms.update(self._lattice_batch_speed_terms(s_v, problem))
+        terms.update(self._lattice_batch_reference_terms(s, l, problem, blocked_ranges))
+        return terms
+
+    def _lattice_batch_hierarchy_scores(self, terms: dict) -> dict:
+        collision_cost = self._batch_topk_max_cost(terms["collision_running"], fraction=0.15)
+        road_cost = self._batch_topk_max_cost(terms["road_running"], fraction=0.15)
+        lateral_accel_limit_cost = np.mean(terms["lateral_accel_limit_running"], axis=1)
+        kappa_limit_cost = np.mean(terms["kappa_limit_running"], axis=1)
+        dkappa_limit_cost = np.mean(terms["dkappa_limit_running"], axis=1)
+        lateral_jerk_limit_cost = np.mean(terms["lateral_jerk_limit_running"], axis=1)
+        speed_limit_cost = np.mean(terms["speed_limit_running"], axis=1)
+        lateral_accel_zero_cost = np.mean(terms["lateral_accel_zero_running"], axis=1)
+        kappa_zero_cost = np.mean(terms["kappa_zero_running"], axis=1)
+        dkappa_zero_cost = np.mean(terms["dkappa_zero_running"], axis=1)
+        lateral_jerk_zero_cost = np.mean(terms["lateral_jerk_zero_running"], axis=1)
+        speed_deviation_cost = np.mean(terms["speed_max_deviation_running"], axis=1)
+        efficiency_cost = np.mean(terms["efficiency_running"], axis=1)
+        reference_lateral_cost = np.mean(terms["reference_lateral_running"], axis=1)
+
+        lateral_accel_hard_score = self._saturate_array(lateral_accel_limit_cost, self.config.dynamic_score_scale)
+        kappa_hard_score = self._saturate_array(kappa_limit_cost, self.config.dynamic_score_scale)
+        dkappa_hard_score = self._saturate_array(dkappa_limit_cost, self.config.dynamic_score_scale)
+        lateral_jerk_hard_score = self._saturate_array(lateral_jerk_limit_cost, self.config.dynamic_score_scale)
+        lateral_accel_soft_score = self._saturate_array(lateral_accel_zero_cost, self.config.comfort_score_scale)
+        kappa_soft_score = self._saturate_array(kappa_zero_cost, self.config.comfort_score_scale)
+        dkappa_soft_score = self._saturate_array(dkappa_zero_cost, self.config.comfort_score_scale)
+        lateral_jerk_soft_score = self._saturate_array(lateral_jerk_zero_cost, self.config.comfort_score_scale)
+        return {
+            "collision_cost": collision_cost,
+            "road_cost": road_cost,
+            "lateral_accel_hard_score": lateral_accel_hard_score,
+            "kappa_hard_score": kappa_hard_score,
+            "dkappa_hard_score": dkappa_hard_score,
+            "lateral_jerk_hard_score": lateral_jerk_hard_score,
+            "efficiency_score": self._saturate_array(
+                efficiency_cost + speed_deviation_cost, self.config.efficiency_score_scale
+            ),
+            "comfort_score": np.clip(
+                np.mean(
+                    np.vstack(
+                        [
+                            lateral_accel_soft_score,
+                            kappa_soft_score,
+                            dkappa_soft_score,
+                            lateral_jerk_soft_score,
+                        ]
+                    ),
+                    axis=0,
+                ),
+                0.0,
+                1.0,
+            ),
+            "reference_score": self._saturate_array(reference_lateral_cost, self.config.reference_score_scale),
+            "speed_score": self._saturate_array(speed_limit_cost + speed_deviation_cost, self.config.speed_score_scale),
+        }
+
+    def _lattice_batch_collision_terms(self, s: np.ndarray, l: np.ndarray, blocked_ranges: Sequence[dict]) -> dict:
+        running = np.zeros_like(s, dtype=float)
+        overlap = np.zeros_like(s, dtype=float)
+        if not blocked_ranges:
+            return {"collision_running": running, "collision_overlap": overlap}
+
+        ego_s_min = s - float(self.config.ego_rear)
+        ego_s_max = s + float(self.config.ego_front)
+        half_width = 0.5 * float(self.config.ego_width)
+        ego_l_min = l - half_width
+        ego_l_max = l + half_width
+        decay = 0.2 + 0.8 * np.exp(-np.maximum(s - s[:, :1], 0.0) / max(float(self.config.collision_decay_s), 1e-3))
+        for blocked in blocked_ranges:
+            s_mask = (ego_s_min <= float(blocked["s_max"])) & (float(blocked["s_min"]) <= ego_s_max)
+            l_mask = (ego_l_min <= float(blocked["l_max"])) & (float(blocked["l_min"]) <= ego_l_max)
+            mask = s_mask & l_mask
+            if not np.any(mask):
+                continue
+            s_overlap = np.minimum(ego_s_max, float(blocked["s_max"])) - np.maximum(ego_s_min, float(blocked["s_min"]))
+            l_overlap = np.minimum(ego_l_max, float(blocked["l_max"])) - np.maximum(ego_l_min, float(blocked["l_min"]))
+            penetration = np.maximum(np.minimum(s_overlap, l_overlap), 0.0)
+            sample_cost = decay * (
+                1.0 + shaped_hinge(penetration, safe=0.0, soft=0.6, tail_gain=0.35, cap=3.0)
+            )
+            running = np.maximum(running, np.where(mask, sample_cost, 0.0))
+            overlap = np.maximum(overlap, mask.astype(float))
+        return {"collision_running": running, "collision_overlap": overlap}
+
+    def _lattice_batch_road_terms(self, l: np.ndarray, problem: PlanningProblem) -> dict:
+        half_width = 0.5 * float(self.config.ego_width)
+        left = max(float(problem.road_boundary.left_l), float(problem.road_boundary.right_l))
+        right = min(float(problem.road_boundary.left_l), float(problem.road_boundary.right_l))
+        ego_l_min = l - half_width
+        ego_l_max = l + half_width
+        left_excess = np.maximum(ego_l_max - left, 0.0)
+        right_excess = np.maximum(right - ego_l_min, 0.0)
+        excess = np.maximum(left_excess, right_excess)
+        edge_clearance = np.minimum(left - ego_l_max, ego_l_min - right)
+        edge_pressure = np.maximum(float(self.config.road_edge_buffer) - edge_clearance, 0.0)
+        violation_cost = shaped_hinge(excess, safe=0.0, soft=0.6, tail_gain=0.25, cap=3.0)
+        edge_cost = 0.35 * shaped_hinge(
+            edge_pressure,
+            safe=0.0,
+            soft=max(float(self.config.road_edge_buffer), 1e-3),
+            tail_gain=0.1,
+            cap=1.5,
+        )
+        return {
+            "road_running": np.asarray(violation_cost + edge_cost, dtype=float),
+            "road_violation": np.asarray(excess > 1e-6, dtype=float),
+        }
+
+    def _lattice_batch_bounded_zero_terms(
+        self,
+        prefix: str,
+        values: np.ndarray,
+        min_value: float,
+        max_value: float,
+        zero_comfort: float,
+        zero_weight: float,
+    ) -> dict:
+        values = np.asarray(values, dtype=float)
+        low = min(float(min_value), float(max_value))
+        high = max(float(min_value), float(max_value))
+        lower_excess = np.maximum(low - values, 0.0)
+        upper_excess = np.maximum(values - high, 0.0)
+        excess = np.maximum(lower_excess, upper_excess)
+        limit_scale = max(0.25 * max(abs(low), abs(high)), 1e-6)
+        return {
+            f"{prefix}_limit_running": shaped_hinge(excess, safe=0.0, soft=limit_scale, tail_gain=0.35, cap=3.0),
+            f"{prefix}_zero_running": float(zero_weight)
+            * pseudo_huber(values / max(float(zero_comfort), 1e-6), delta=1.0),
+            f"{prefix}_violation": np.asarray(excess > 1e-6, dtype=float),
+        }
+
+    def _lattice_batch_speed_terms(self, s_v: np.ndarray, problem: PlanningProblem) -> dict:
+        s_v = np.asarray(s_v, dtype=float)
+        max_speed = max(float(self.config.max_longitudinal_speed), 1e-3)
+        comfort = max(float(self.config.speed_tracking_comfort), 1e-3)
+        speed_tracking = pseudo_huber((s_v - max_speed) / comfort, delta=1.0)
+        target_speed = self._target_speed(problem)
+        low_speed_shortfall = np.maximum(float(target_speed) - s_v, 0.0)
+        efficiency_running = pseudo_huber(low_speed_shortfall / comfort, delta=1.0)
+        reverse_excess = np.maximum(-s_v, 0.0)
+        speed_excess = np.maximum(s_v - max_speed, 0.0)
+        speed_pressure = shaped_hinge(speed_excess, safe=0.0, soft=1.0, tail_gain=0.35, cap=3.0)
+        reverse_pressure = shaped_hinge(reverse_excess, safe=0.0, soft=0.5, tail_gain=0.35, cap=3.0)
+        return {
+            "speed_limit_running": speed_pressure + reverse_pressure,
+            "speed_tracking_running": speed_tracking,
+            "speed_max_deviation_running": speed_tracking,
+            "efficiency_running": efficiency_running,
+            "speed_violation": np.asarray((reverse_excess > 1e-6) | (speed_excess > 1e-6), dtype=float),
+        }
+
+    def _lattice_batch_reference_terms(
+        self,
+        s: np.ndarray,
+        l: np.ndarray,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
+        target = self._reference_lateral_target(problem)
+        comfort = max(float(self.config.reference_lateral_comfort), 1e-6)
+        deviation_cost = pseudo_huber((l - float(target)) / comfort, delta=1.0)
+        n = l.shape[1]
+        time_weight = np.linspace(
+            float(self.config.reference_lateral_time_weight_start),
+            float(self.config.reference_lateral_time_weight_end),
+            num=n,
+            dtype=float,
+        )
+        relief = np.ones_like(l, dtype=float)
+        buffer = max(float(self.config.reference_obstacle_relief_buffer), 0.0)
+        relief_weight = float(np.clip(float(self.config.reference_obstacle_relief_weight), 0.0, 1.0))
+        for blocked in blocked_ranges:
+            near = (s >= float(blocked["s_min"]) - buffer) & (s <= float(blocked["s_max"]) + buffer)
+            relief[near] = np.minimum(relief[near], relief_weight)
+        return {
+            "reference_lateral_target": float(target),
+            "reference_lateral_running": time_weight[None, :] * relief * deviation_cost,
+        }
+
+    def _lattice_batch_certificate_score(
+        self,
+        trajectory_batch: dict,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> np.ndarray:
+        s = np.asarray(trajectory_batch["s"], dtype=float)
+        if not bool(self.config.trajectory_certificate_enabled):
+            return np.zeros((s.shape[0],), dtype=float)
+
+        l = np.asarray(trajectory_batch["l"], dtype=float)
+        s_v = np.asarray(trajectory_batch.get("s_v"), dtype=float)
+        l_v = np.asarray(trajectory_batch.get("l_v"), dtype=float)
+        l_a = np.asarray(trajectory_batch.get("l_a"), dtype=float)
+        t = np.asarray(trajectory_batch["t"], dtype=float)
+        kappa = trajectory_batch.get("kappa")
+        kappa_values = np.zeros_like(s, dtype=float) if kappa is None else np.asarray(kappa, dtype=float)
+        dkappa = self._batch_dkappa_values(trajectory_batch, kappa_values)
+        lateral_jerk = self._batch_gradient(l_a, t)
+
+        s_t = s[:, -1]
+        l_t = l[:, -1]
+        v_t = np.maximum(s_v[:, -1], 0.0)
+        dl_ds_t = self._batch_terminal_dl_ds(s, l, s_v, l_v, t)
+        preview_distance = np.clip(
+            v_t * max(float(self.config.terminal_future_preview_time), 0.0),
+            max(float(self.config.terminal_future_min_preview_distance), 0.0),
+            max(float(self.config.terminal_future_max_preview_distance), 1e-6),
+        )
+        future_score, feasible_progress = self._lattice_batch_terminal_future_rollout_score(
+            s_t=s_t,
+            l_t=l_t,
+            dl_ds_t=dl_ds_t,
+            preview_distance=preview_distance,
+            problem=problem,
+            blocked_ranges=blocked_ranges,
+        )
+        recoverability_score = self._lattice_batch_terminal_recoverability_score(
+            l_t=l_t,
+            dl_ds_t=dl_ds_t,
+            kappa_t=kappa_values[:, -1],
+            dkappa_t=dkappa[:, -1],
+            lateral_accel_t=l_a[:, -1],
+            lateral_jerk_t=lateral_jerk[:, -1],
+            problem=problem,
+        )
+        progress_score = self._unit_hinge_array(
+            np.maximum(preview_distance - feasible_progress, 0.0), soft=np.maximum(preview_distance, 1.0)
+        )
+        speed_score = self._unit_pseudo_huber_array(
+            np.maximum(float(self._target_speed(problem)) - v_t, 0.0),
+            comfort=float(self.config.terminal_speed_comfort),
+        )
+        terminal_value = self._weighted_unit_score_array(
+            [
+                (future_score, self.config.terminal_future_feasibility_weight),
+                (recoverability_score, self.config.terminal_recoverability_weight),
+                (progress_score, self.config.terminal_progress_weight),
+                (speed_score, self.config.terminal_speed_weight),
+            ]
+        )
+        return np.clip(
+            terminal_value / max(float(self.config.trajectory_certificate_score_scale), 1e-6),
+            0.0,
+            1.0,
+        )
+
+    def _lattice_batch_terminal_recoverability_score(
+        self,
+        l_t: np.ndarray,
+        dl_ds_t: np.ndarray,
+        kappa_t: np.ndarray,
+        dkappa_t: np.ndarray,
+        lateral_accel_t: np.ndarray,
+        lateral_jerk_t: np.ndarray,
+        problem: PlanningProblem,
+    ) -> np.ndarray:
+        center_right, center_left = self._center_lateral_interval(problem)
+        boundary_clearance = np.minimum(l_t - center_right, center_left - l_t)
+        boundary_score = self._unit_hinge_array(
+            float(self.config.terminal_boundary_clearance_comfort) - boundary_clearance,
+            soft=max(float(self.config.terminal_boundary_clearance_comfort), 1e-6),
+        )
+        return self._weighted_unit_score_array(
+            [
+                (self._unit_pseudo_huber_array(np.abs(dl_ds_t), self.config.terminal_dl_ds_comfort), 1.0),
+                (self._unit_pseudo_huber_array(np.abs(kappa_t), self.config.terminal_kappa_comfort), 1.0),
+                (self._unit_pseudo_huber_array(np.abs(dkappa_t), self.config.terminal_dkappa_comfort), 1.0),
+                (
+                    self._unit_pseudo_huber_array(
+                        np.abs(lateral_accel_t), self.config.terminal_lateral_accel_comfort
+                    ),
+                    1.0,
+                ),
+                (
+                    self._unit_pseudo_huber_array(
+                        np.abs(lateral_jerk_t), self.config.terminal_lateral_jerk_comfort
+                    ),
+                    1.0,
+                ),
+                (boundary_score, 1.0),
+            ]
+        )
+
+    def _lattice_batch_terminal_future_rollout_score(
+        self,
+        s_t: np.ndarray,
+        l_t: np.ndarray,
+        dl_ds_t: np.ndarray,
+        preview_distance: np.ndarray,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        batch_size = s_t.shape[0]
+        step_s = max(float(self.config.terminal_future_step_s), 0.25)
+        max_preview = max(float(np.max(preview_distance)), step_s)
+        n_steps = max(1, int(math.ceil(max_preview / step_s)))
+        fractions = np.linspace(1.0 / float(n_steps), 1.0, num=n_steps, dtype=float)
+        slope_delta = max(float(self.config.terminal_future_slope_delta), 0.0)
+        primitive_targets = [
+            dl_ds_t,
+            np.zeros_like(dl_ds_t),
+            dl_ds_t + slope_delta,
+            dl_ds_t - slope_delta,
+        ]
+
+        best_score = np.ones((batch_size,), dtype=float)
+        best_feasible_progress = np.zeros((batch_size,), dtype=float)
+        for target_slope in primitive_targets:
+            distances = preview_distance[:, None] * fractions[None, :]
+            s_hat = s_t[:, None] + distances
+            l_hat = l_t[:, None] + dl_ds_t[:, None] * distances + 0.5 * (
+                target_slope[:, None] - dl_ds_t[:, None]
+            ) * (distances * distances / np.maximum(preview_distance[:, None], 1e-6))
+            sample_score, hard = self._lattice_batch_terminal_future_sample_score(
+                s_hat=s_hat,
+                l_hat=l_hat,
+                problem=problem,
+                blocked_ranges=blocked_ranges,
+            )
+            primitive_score = self._batch_topk_max_cost(sample_score, fraction=0.2)
+            has_hard = np.any(hard, axis=1)
+            first_hard = np.argmax(hard, axis=1)
+            row = np.arange(batch_size)
+            prev_index = np.maximum(first_hard - 1, 0)
+            progress_if_blocked = np.where(first_hard > 0, distances[row, prev_index], 0.0)
+            feasible_progress = np.where(has_hard, progress_if_blocked, preview_distance)
+            best_score = np.minimum(best_score, primitive_score)
+            best_feasible_progress = np.maximum(best_feasible_progress, feasible_progress)
+        return np.clip(best_score, 0.0, 1.0), np.clip(best_feasible_progress, 0.0, preview_distance)
+
+    def _lattice_batch_terminal_future_sample_score(
+        self,
+        s_hat: np.ndarray,
+        l_hat: np.ndarray,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        center_right, center_left = self._center_lateral_interval(problem)
+        if center_left <= center_right:
+            return np.ones_like(s_hat, dtype=float), np.ones_like(s_hat, dtype=bool)
+
+        hard = (l_hat < center_right) | (l_hat > center_left)
+        interval_min = np.full_like(l_hat, center_right, dtype=float)
+        interval_max = np.full_like(l_hat, center_left, dtype=float)
+        half_width = 0.5 * float(self.config.ego_width)
+        ego_s_min = s_hat - float(self.config.ego_rear)
+        ego_s_max = s_hat + float(self.config.ego_front)
+        ego_l_min = l_hat - half_width
+        ego_l_max = l_hat + half_width
+        for blocked in blocked_ranges:
+            active_s = (ego_s_min <= float(blocked["s_max"])) & (float(blocked["s_min"]) <= ego_s_max)
+            hard |= active_s & (ego_l_min <= float(blocked["l_max"])) & (float(blocked["l_min"]) <= ego_l_max)
+
+            blocked_l_min = float(blocked["l_min"]) - half_width
+            blocked_l_max = float(blocked["l_max"]) + half_width
+            inside_center_block = active_s & (l_hat >= blocked_l_min) & (l_hat <= blocked_l_max)
+            hard |= inside_center_block
+            left_side = active_s & (l_hat < blocked_l_min)
+            right_side = active_s & (l_hat > blocked_l_max)
+            interval_max = np.where(left_side, np.minimum(interval_max, blocked_l_min), interval_max)
+            interval_min = np.where(right_side, np.maximum(interval_min, blocked_l_max), interval_min)
+
+        containing_width = np.maximum(interval_max - interval_min, 0.0)
+        hard |= containing_width <= 1e-6
+        road_width = max(center_left - center_right, 1e-6)
+        desired_width = min(float(self.config.terminal_future_min_free_width), max(0.3 * road_width, 0.5))
+        space_score = self._unit_hinge_array(desired_width - containing_width, soft=max(desired_width, 1e-6))
+        edge_clearance = np.minimum(l_hat - center_right, center_left - l_hat)
+        edge_score = 0.2 * self._unit_hinge_array(
+            float(self.config.terminal_boundary_clearance_comfort) - edge_clearance,
+            soft=max(float(self.config.terminal_boundary_clearance_comfort), 1e-6),
+        )
+        score = np.maximum(space_score, edge_score)
+        return np.where(hard, 1.0, np.clip(score, 0.0, 1.0)), hard
+
+    def _batch_terminal_dl_ds(
+        self,
+        s: np.ndarray,
+        l: np.ndarray,
+        s_v: np.ndarray,
+        l_v: np.ndarray,
+        t: np.ndarray,
+    ) -> np.ndarray:
+        tail_time = max(float(self.config.terminal_tail_time), 0.0)
+        mask = t >= float(t[-1]) - tail_time
+        if np.count_nonzero(mask) >= 2:
+            s_tail = s[:, mask]
+            l_tail = l[:, mask]
+            s_mean = np.mean(s_tail, axis=1, keepdims=True)
+            l_mean = np.mean(l_tail, axis=1, keepdims=True)
+            denom = np.sum((s_tail - s_mean) ** 2, axis=1)
+            numer = np.sum((s_tail - s_mean) * (l_tail - l_mean), axis=1)
+            slope = np.divide(numer, denom, out=np.zeros_like(numer), where=denom > 1e-9)
+            good = denom > 1e-9
+        else:
+            slope = np.zeros((s.shape[0],), dtype=float)
+            good = np.zeros((s.shape[0],), dtype=bool)
+        velocity_slope = np.divide(l_v[:, -1], s_v[:, -1], out=np.zeros_like(l_v[:, -1]), where=np.abs(s_v[:, -1]) > 1e-6)
+        if s.shape[1] >= 2:
+            ds = s[:, -1] - s[:, -2]
+            diff_slope = np.divide(l[:, -1] - l[:, -2], ds, out=velocity_slope.copy(), where=np.abs(ds) > 1e-6)
+        else:
+            diff_slope = velocity_slope
+        return np.where(good, slope, diff_slope)
+
+    def _batch_dkappa_values(self, trajectory_batch: dict, kappa: np.ndarray) -> np.ndarray:
+        x = trajectory_batch.get("x")
+        y = trajectory_batch.get("y")
+        if x is not None and y is not None:
+            x_values = np.asarray(x, dtype=float)
+            y_values = np.asarray(y, dtype=float)
+            ds = np.hypot(np.diff(x_values, axis=1), np.diff(y_values, axis=1))
+            coordinate = np.concatenate([np.zeros((x_values.shape[0], 1), dtype=float), np.cumsum(ds, axis=1)], axis=1)
+        else:
+            coordinate = np.asarray(trajectory_batch["s"], dtype=float)
+        return self._batch_gradient(np.asarray(kappa, dtype=float), coordinate)
+
+    @staticmethod
+    def _batch_gradient(values: np.ndarray, coordinate: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        coordinate = np.asarray(coordinate, dtype=float)
+        if values.shape[-1] <= 1:
+            return np.zeros_like(values)
+        if coordinate.ndim == 1:
+            edge_order = 2 if values.shape[-1] >= 3 else 1
+            return np.gradient(values, coordinate, axis=-1, edge_order=edge_order)
+
+        out = np.zeros_like(values, dtype=float)
+        for row in range(values.shape[0]):
+            row_values = values[row]
+            row_coordinate = coordinate[row]
+            finite = np.isfinite(row_values) & np.isfinite(row_coordinate)
+            if np.count_nonzero(finite) < 2:
+                continue
+            finite_indices = np.where(finite)[0]
+            local_values = row_values[finite]
+            local_coordinate = row_coordinate[finite]
+            if np.any(np.diff(local_coordinate) <= 1e-6):
+                local_coordinate = np.arange(local_values.size, dtype=float)
+            edge_order = 2 if local_values.size >= 3 else 1
+            out[row, finite_indices] = np.gradient(local_values, local_coordinate, edge_order=edge_order)
+        return out
+
+    @staticmethod
+    def _batch_topk_max_cost(values: np.ndarray, fraction: float) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        if values.shape[1] == 0:
+            return np.zeros((values.shape[0],), dtype=float)
+        k = max(1, int(math.ceil(values.shape[1] * float(fraction))))
+        top = np.partition(values, -k, axis=1)[:, -k:]
+        return 0.7 * np.mean(top, axis=1) + 0.3 * np.max(values, axis=1)
+
+    @staticmethod
+    def _saturate_array(value, scale: float) -> np.ndarray:
+        value = np.maximum(np.asarray(value, dtype=float), 0.0)
+        scale = max(float(scale), 1e-6)
+        return value / (value + scale)
+
+    @staticmethod
+    def _unit_hinge_array(value, soft) -> np.ndarray:
+        value = np.maximum(np.asarray(value, dtype=float), 0.0)
+        soft = np.maximum(np.asarray(soft, dtype=float), 1e-6)
+        z = np.maximum(value / soft, 0.0)
+        smooth = z * z * (3.0 - 2.0 * np.minimum(z, 1.0))
+        tail = 1.0 + 0.25 * np.log1p(np.maximum(z - 1.0, 0.0))
+        return np.clip(np.where(z <= 1.0, smooth, tail), 0.0, 1.0)
+
+    @staticmethod
+    def _unit_pseudo_huber_array(value, comfort: float) -> np.ndarray:
+        raw = pseudo_huber(np.asarray(value, dtype=float) / max(float(comfort), 1e-6), delta=1.0)
+        return np.clip(raw / (raw + 1.0), 0.0, 1.0)
+
+    @staticmethod
+    def _weighted_unit_score_array(weighted_scores: Sequence[tuple[np.ndarray, float]]) -> np.ndarray:
+        total_weight = 0.0
+        total_score = None
+        for score, weight in weighted_scores:
+            weight = max(float(weight), 0.0)
+            if weight <= 0.0:
+                continue
+            values = np.clip(np.asarray(score, dtype=float), 0.0, 1.0)
+            total_score = values * weight if total_score is None else total_score + values * weight
+            total_weight += weight
+        if total_score is None or total_weight <= 1e-9:
+            first = np.asarray(weighted_scores[0][0], dtype=float)
+            return np.zeros_like(first)
+        return np.clip(total_score / total_weight, 0.0, 1.0)
+
     def _trajectory_level_certificate_terms(
         self,
         trajectory: Trajectory,

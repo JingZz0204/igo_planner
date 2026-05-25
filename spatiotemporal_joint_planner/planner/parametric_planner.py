@@ -28,6 +28,7 @@ class ParametricPlannerConfig:
     candidate_limit: int = 16
     warm_start: bool = True
     max_initial_anchors: int = 96
+    objective_mode: str = "auto"
 
 
 class ParametricPlanner(Planner):
@@ -66,8 +67,37 @@ class ParametricPlanner(Planner):
                 return float("inf")
             return float(cost.total)
 
+        def objective_batch(parameters_batch: np.ndarray) -> np.ndarray:
+            parameters_batch = np.asarray(parameters_batch, dtype=float)
+            if not hasattr(self.trajectory_model, "decode_batch_arrays"):
+                return np.asarray([objective(parameters) for parameters in parameters_batch], dtype=float)
+            batch_evaluator = getattr(self.cost_function, "evaluate_batch", None)
+            if batch_evaluator is None:
+                model_prefix = self.trajectory_model.name.removesuffix("_trajectory")
+                batch_evaluator = getattr(self.cost_function, f"evaluate_{model_prefix}_batch", None)
+            if batch_evaluator is None:
+                return np.asarray([objective(parameters) for parameters in parameters_batch], dtype=float)
+            try:
+                trajectory_batch = self.trajectory_model.decode_batch_arrays(parameters_batch, problem)
+                values = batch_evaluator(trajectory_batch, problem)
+                values = np.asarray(values, dtype=float).reshape(-1)
+                if values.shape == (parameters_batch.shape[0],):
+                    values[~np.isfinite(values)] = float("inf")
+                    return values
+            except Exception:
+                pass
+            return np.asarray([objective(parameters) for parameters in parameters_batch], dtype=float)
+
+        objective_batch_fn = None
+        objective_mode = str(self.config.objective_mode).lower()
+        if objective_mode not in {"auto", "vectorized", "scalar"}:
+            raise ValueError(f"Unsupported objective_mode: {self.config.objective_mode}")
+        if objective_mode != "scalar":
+            objective_batch_fn = objective_batch
+
         optimization_problem = OptimizationProblem(
             objective=objective,
+            objective_batch=objective_batch_fn,
             initial_population=seeds,
             lower_bound=low,
             upper_bound=high,
@@ -75,6 +105,7 @@ class ParametricPlanner(Planner):
                 "planner": self.name,
                 "trajectory_model": self.trajectory_model.name,
                 "cost_function": self.cost_function.name,
+                "objective_mode": objective_mode,
             },
         )
         optimization = self.optimizer.optimize(optimization_problem)
@@ -102,6 +133,8 @@ class ParametricPlanner(Planner):
                 "cost_function": self.cost_function.name,
                 "optimizer": self.optimizer.name,
                 "parameter_dim": int(self.trajectory_model.parameter_dim(problem)),
+                "objective_mode": objective_mode,
+                "objective_batch_enabled": objective_batch_fn is not None,
             },
         )
 

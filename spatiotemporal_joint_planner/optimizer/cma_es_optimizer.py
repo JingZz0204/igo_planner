@@ -73,7 +73,7 @@ class CMAESOptimizer(Optimizer):
 
         anchor_positions = self._clip_positions_to_bounds(anchors, bounds)
         if anchor_positions.size:
-            anchor_values = np.asarray([self._evaluate(problem, position) for position in anchor_positions], dtype=float)
+            anchor_values = self._evaluate_many(problem, anchor_positions)
             all_positions.append(anchor_positions)
             all_values.append(anchor_values)
             anchor_best_idx = int(np.argmin(anchor_values))
@@ -87,7 +87,7 @@ class CMAESOptimizer(Optimizer):
         for iteration in range(int(self.config.n_iterations)):
             unit_samples, component_ids = self._sample_population(state)
             positions = denormalize_parameters(unit_samples, bounds)
-            values = np.asarray([self._evaluate(problem, position) for position in positions], dtype=float)
+            values = self._evaluate_many(problem, positions)
             all_positions.append(positions)
             all_values.append(values)
 
@@ -411,3 +411,23 @@ class CMAESOptimizer(Optimizer):
         if not np.isfinite(value):
             return float("inf")
         return value
+
+    @classmethod
+    def _evaluate_many(cls, problem: OptimizationProblem, positions: np.ndarray) -> np.ndarray:
+        positions = np.asarray(positions, dtype=float)
+        if positions.size == 0:
+            return np.empty((0,), dtype=float)
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+
+        if problem.objective_batch is not None:
+            try:
+                values = np.asarray(problem.objective_batch(positions), dtype=float).reshape(-1)
+                if values.shape == (positions.shape[0],):
+                    values = values.copy()
+                    values[~np.isfinite(values)] = float("inf")
+                    return values
+            except Exception:
+                pass
+
+        return np.asarray([cls._evaluate(problem, position) for position in positions], dtype=float)

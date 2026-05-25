@@ -84,6 +84,7 @@ class CostResult:
 class OptimizationProblem:
     objective: Callable[[np.ndarray], float]
     initial_population: np.ndarray
+    objective_batch: Optional[Callable[[np.ndarray], np.ndarray]] = None
     lower_bound: Optional[np.ndarray] = None
     upper_bound: Optional[np.ndarray] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
