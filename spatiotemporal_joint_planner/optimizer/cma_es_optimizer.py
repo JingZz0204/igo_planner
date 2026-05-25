@@ -1,0 +1,413 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+
+from spatiotemporal_joint_planner.common import OptimizationProblem, OptimizationResult
+from spatiotemporal_joint_planner.optimizer.base import Optimizer
+
+
+def normalize_parameters(parameters: np.ndarray, bounds: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    low, high = bounds
+    return (np.asarray(parameters, dtype=float) - low) / np.maximum(high - low, 1e-12)
+
+
+def denormalize_parameters(unit_parameters: np.ndarray, bounds: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    low, high = bounds
+    return low + np.asarray(unit_parameters, dtype=float) * (high - low)
+
+
+@dataclass(frozen=True)
+class CMAESConfig:
+    n_components: int = 4
+    n_samples: int = 64
+    n_iterations: int = 10
+    elite_fraction: float = 0.25
+    init_std: float = 0.22
+    min_std: float = 0.035
+    max_std: float = 0.45
+    weight_floor: float = 1e-3
+    weight_lr: float = 0.55
+    seed: int = 0
+
+
+@dataclass
+class _CMAComponentState:
+    mean: np.ndarray
+    sigma: float
+    covariance: np.ndarray
+    p_sigma: np.ndarray
+    p_c: np.ndarray
+
+
+@dataclass
+class _MixtureState:
+    weights: np.ndarray
+    components: list[_CMAComponentState]
+
+
+class CMAESOptimizer(Optimizer):
+    """Multi-modal CMA-ES optimizer in normalized parameter space."""
+
+    def __init__(self, config: Optional[CMAESConfig] = None, warm_start: bool = True):
+        self.config = config or CMAESConfig()
+        self.warm_start = bool(warm_start)
+        self._last_position: Optional[np.ndarray] = None
+        self._rng = np.random.default_rng(self.config.seed)
+
+    @property
+    def name(self) -> str:
+        return "cma_es"
+
+    def optimize(self, problem: OptimizationProblem) -> OptimizationResult:
+        anchors = self._as_anchor_matrix(problem.initial_population)
+        bounds = self._resolve_bounds(problem, anchors)
+
+        best_position = None
+        best_value = float("inf")
+        all_positions = []
+        all_values = []
+        history = []
+
+        anchor_positions = self._clip_positions_to_bounds(anchors, bounds)
+        if anchor_positions.size:
+            anchor_values = np.asarray([self._evaluate(problem, position) for position in anchor_positions], dtype=float)
+            all_positions.append(anchor_positions)
+            all_values.append(anchor_values)
+            anchor_best_idx = int(np.argmin(anchor_values))
+            if float(anchor_values[anchor_best_idx]) < best_value:
+                best_value = float(anchor_values[anchor_best_idx])
+                best_position = np.asarray(anchor_positions[anchor_best_idx], dtype=float).copy()
+            anchors = self._ranked_seed_anchors(anchor_positions, anchor_values, int(self.config.n_components))
+
+        state = self._initial_state(bounds, anchors)
+
+        for iteration in range(int(self.config.n_iterations)):
+            unit_samples, component_ids = self._sample_population(state)
+            positions = denormalize_parameters(unit_samples, bounds)
+            values = np.asarray([self._evaluate(problem, position) for position in positions], dtype=float)
+            all_positions.append(positions)
+            all_values.append(values)
+
+            iter_best_idx = int(np.argmin(values))
+            iter_best_value = float(values[iter_best_idx])
+            if iter_best_value < best_value:
+                best_value = iter_best_value
+                best_position = np.asarray(positions[iter_best_idx], dtype=float).copy()
+
+            state = self._update_mixture(state, unit_samples, component_ids, values, iteration)
+            history.append(self._history_item(iteration, state, iter_best_value))
+
+        if best_position is None:
+            raise RuntimeError("CMA-ES did not evaluate any samples.")
+
+        if self.warm_start:
+            self._last_position = best_position.copy()
+
+        population = np.vstack(all_positions) if all_positions else np.empty((0, best_position.size), dtype=float)
+        values = np.concatenate(all_values) if all_values else np.empty((0,), dtype=float)
+        return OptimizationResult(
+            best_position=best_position,
+            best_value=best_value,
+            population=population,
+            values=values,
+            history=history,
+            metadata={
+                "optimizer": self.name,
+                "bounds": bounds,
+                "n_components": int(self.config.n_components),
+                "n_samples": int(self.config.n_samples),
+                "n_iterations": int(self.config.n_iterations),
+            },
+        )
+
+    def reset(self) -> None:
+        self._last_position = None
+
+    def _initial_state(self, bounds: tuple[np.ndarray, np.ndarray], anchors: np.ndarray) -> _MixtureState:
+        dim = int(bounds[0].size)
+        n_components = max(int(self.config.n_components), 1)
+        init_std = float(np.clip(self.config.init_std, self.config.min_std, self.config.max_std))
+
+        seed_means = []
+        if self.warm_start and self._last_position is not None and self._last_position.shape == (dim,):
+            seed_means.append(np.clip(normalize_parameters(self._last_position, bounds), 0.0, 1.0))
+
+        for anchor in anchors:
+            if anchor.shape == (dim,):
+                seed_means.append(np.clip(normalize_parameters(anchor, bounds), 0.0, 1.0))
+
+        while len(seed_means) < n_components:
+            if seed_means:
+                base = seed_means[len(seed_means) % len(seed_means)]
+                seed_means.append(np.clip(base + self._rng.normal(0.0, 0.20, size=(dim,)), 0.0, 1.0))
+            else:
+                seed_means.append(self._rng.uniform(0.0, 1.0, size=(dim,)))
+
+        components = [
+            _CMAComponentState(
+                mean=np.asarray(mean, dtype=float).copy(),
+                sigma=init_std,
+                covariance=np.eye(dim, dtype=float),
+                p_sigma=np.zeros((dim,), dtype=float),
+                p_c=np.zeros((dim,), dtype=float),
+            )
+            for mean in seed_means[:n_components]
+        ]
+        weights = np.full((n_components,), 1.0 / float(n_components), dtype=float)
+        return _MixtureState(weights=weights, components=components)
+
+    def _sample_population(self, state: _MixtureState) -> tuple[np.ndarray, np.ndarray]:
+        total_samples = max(int(self.config.n_samples), len(state.components))
+        counts = self._component_counts(state.weights, total_samples)
+        samples = []
+        component_ids = []
+
+        for component_id, (component, count) in enumerate(zip(state.components, counts)):
+            for sample in self._sample_component(component, int(count), include_mean=True):
+                samples.append(sample)
+                component_ids.append(component_id)
+
+        return np.asarray(samples, dtype=float), np.asarray(component_ids, dtype=int)
+
+    def _sample_component(self, component: _CMAComponentState, count: int, include_mean: bool) -> list[np.ndarray]:
+        dim = int(component.mean.size)
+        count = max(int(count), 1)
+        samples = []
+        if include_mean:
+            samples.append(component.mean.copy())
+
+        eigvals, eigvecs = self._eigendecomposition(component.covariance)
+        transform = eigvecs @ np.diag(np.sqrt(eigvals))
+        while len(samples) < count:
+            z = self._rng.normal(0.0, 1.0, size=(dim,))
+            samples.append(np.clip(component.mean + float(component.sigma) * (transform @ z), 0.0, 1.0))
+        return samples[:count]
+
+    def _update_mixture(
+        self,
+        state: _MixtureState,
+        samples: np.ndarray,
+        component_ids: np.ndarray,
+        values: np.ndarray,
+        iteration: int,
+    ) -> _MixtureState:
+        new_components = []
+        for component_id, component in enumerate(state.components):
+            local_indices = np.where(component_ids == component_id)[0]
+            if local_indices.size == 0:
+                new_components.append(component)
+                continue
+            local_order = sorted(local_indices.tolist(), key=lambda idx: float(values[idx]))
+            elite_n = max(1, min(len(local_order), int(np.ceil(len(local_order) * float(self.config.elite_fraction)))))
+            selected = samples[local_order[:elite_n]]
+            weights = self._recombination_weights(elite_n)
+            new_components.append(self._update_component(component, selected, weights, iteration))
+
+        return _MixtureState(
+            weights=self._update_component_weights(state.weights, component_ids, values),
+            components=new_components,
+        )
+
+    def _update_component(
+        self,
+        component: _CMAComponentState,
+        selected: np.ndarray,
+        weights: np.ndarray,
+        iteration: int,
+    ) -> _CMAComponentState:
+        dim = int(component.mean.size)
+        mu_eff = 1.0 / float(np.sum(weights**2))
+        params = self._strategy_parameters(dim, mu_eff)
+
+        old_mean = component.mean.copy()
+        sigma = max(float(component.sigma), 1e-12)
+        y_selected = (np.asarray(selected, dtype=float) - old_mean[None, :]) / sigma
+        y_w = np.sum(y_selected * weights[:, None], axis=0)
+        mean = np.clip(old_mean + sigma * y_w, 0.0, 1.0)
+
+        eigvals, eigvecs = self._eigendecomposition(component.covariance)
+        invsqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+
+        cs = params["cs"]
+        cc = params["cc"]
+        c1 = params["c1"]
+        cmu = params["cmu"]
+        chi_n = params["chi_n"]
+
+        p_sigma = (1.0 - cs) * component.p_sigma + np.sqrt(cs * (2.0 - cs) * mu_eff) * (invsqrt @ y_w)
+        norm_p_sigma = float(np.linalg.norm(p_sigma))
+        denom = np.sqrt(max(1.0 - (1.0 - cs) ** (2.0 * (iteration + 1)), 1e-12)) * chi_n
+        h_sigma = float(norm_p_sigma / max(denom, 1e-12) < 1.4 + 2.0 / (dim + 1.0))
+        p_c = (1.0 - cc) * component.p_c + h_sigma * np.sqrt(cc * (2.0 - cc) * mu_eff) * y_w
+
+        rank_mu = np.zeros_like(component.covariance)
+        for weight, y in zip(weights, y_selected):
+            rank_mu += float(weight) * np.outer(y, y)
+
+        covariance = (
+            (1.0 - c1 - cmu + (1.0 - h_sigma) * c1 * cc * (2.0 - cc)) * component.covariance
+            + c1 * np.outer(p_c, p_c)
+            + cmu * rank_mu
+        )
+        covariance = self._repair_covariance(covariance)
+        sigma = sigma * np.exp((cs / params["damps"]) * (norm_p_sigma / max(chi_n, 1e-12) - 1.0))
+        sigma = float(np.clip(sigma, float(self.config.min_std), float(self.config.max_std)))
+        return _CMAComponentState(mean=mean, sigma=sigma, covariance=covariance, p_sigma=p_sigma, p_c=p_c)
+
+    def _update_component_weights(self, old_weights: np.ndarray, component_ids: np.ndarray, values: np.ndarray) -> np.ndarray:
+        k = int(old_weights.size)
+        elite_n = max(1, int(np.ceil(len(values) * float(self.config.elite_fraction))))
+        order = sorted(range(len(values)), key=lambda idx: float(values[idx]))
+        utility = np.zeros((len(values),), dtype=float)
+        rank_weights = self._recombination_weights(elite_n)
+        for rank, idx in enumerate(order[:elite_n]):
+            utility[idx] = rank_weights[rank]
+
+        target = np.zeros((k,), dtype=float)
+        for component_id in range(k):
+            target[component_id] = float(np.sum(utility[component_ids == component_id]))
+
+        floor = float(self.config.weight_floor)
+        if float(np.sum(target)) <= 1e-12:
+            target = np.asarray(old_weights, dtype=float)
+        target = np.maximum(target, floor)
+        target /= np.sum(target)
+
+        weights = (1.0 - float(self.config.weight_lr)) * np.asarray(old_weights, dtype=float) + float(self.config.weight_lr) * target
+        weights = np.maximum(weights, floor)
+        weights /= np.sum(weights)
+        return weights
+
+    def _history_item(self, iteration: int, state: _MixtureState, best_value: float) -> dict:
+        sigmas = np.asarray([component.sigma for component in state.components], dtype=float)
+        return {
+            "iteration": int(iteration),
+            "best_value": float(best_value),
+            "weights": state.weights.copy(),
+            "mean_sigma": float(np.sum(state.weights * sigmas)),
+        }
+
+    @staticmethod
+    def _component_counts(weights: np.ndarray, total_samples: int) -> np.ndarray:
+        weights = np.asarray(weights, dtype=float)
+        total_samples = max(int(total_samples), int(weights.size))
+        raw = weights * float(total_samples)
+        counts = np.maximum(np.floor(raw).astype(int), 1)
+
+        while int(np.sum(counts)) < total_samples:
+            counts[int(np.argmax(raw - counts))] += 1
+        while int(np.sum(counts)) > total_samples:
+            reducible = np.where(counts > 1)[0]
+            if reducible.size == 0:
+                break
+            idx = int(reducible[np.argmin(raw[reducible] - counts[reducible])])
+            counts[idx] -= 1
+        return counts
+
+    @staticmethod
+    def _recombination_weights(mu: int) -> np.ndarray:
+        mu = max(int(mu), 1)
+        ranks = np.arange(1, mu + 1, dtype=float)
+        weights = np.log(float(mu) + 0.5) - np.log(ranks)
+        weights = np.maximum(weights, 0.0)
+        total = float(np.sum(weights))
+        if total <= 1e-12:
+            return np.full((mu,), 1.0 / float(mu), dtype=float)
+        return weights / total
+
+    @staticmethod
+    def _strategy_parameters(dim: int, mu_eff: float) -> dict:
+        dim = max(int(dim), 1)
+        cc = (4.0 + mu_eff / dim) / (dim + 4.0 + 2.0 * mu_eff / dim)
+        cs = (mu_eff + 2.0) / (dim + mu_eff + 5.0)
+        c1 = 2.0 / ((dim + 1.3) ** 2 + mu_eff)
+        cmu = min(1.0 - c1, 2.0 * (mu_eff - 2.0 + 1.0 / mu_eff) / ((dim + 2.0) ** 2 + mu_eff))
+        damps = 1.0 + 2.0 * max(0.0, np.sqrt((mu_eff - 1.0) / (dim + 1.0)) - 1.0) + cs
+        chi_n = np.sqrt(float(dim)) * (1.0 - 1.0 / (4.0 * dim) + 1.0 / (21.0 * dim * dim))
+        return {
+            "cc": float(cc),
+            "cs": float(cs),
+            "c1": float(c1),
+            "cmu": float(max(cmu, 0.0)),
+            "damps": float(damps),
+            "chi_n": float(chi_n),
+        }
+
+    @staticmethod
+    def _eigendecomposition(covariance: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        covariance = 0.5 * (np.asarray(covariance, dtype=float) + np.asarray(covariance, dtype=float).T)
+        eigvals, eigvecs = np.linalg.eigh(covariance)
+        return np.clip(eigvals, 1e-10, 1e3), eigvecs
+
+    @classmethod
+    def _repair_covariance(cls, covariance: np.ndarray) -> np.ndarray:
+        eigvals, eigvecs = cls._eigendecomposition(covariance)
+        repaired = eigvecs @ np.diag(eigvals) @ eigvecs.T
+        return 0.5 * (repaired + repaired.T)
+
+    @staticmethod
+    def _as_anchor_matrix(initial_population: np.ndarray) -> np.ndarray:
+        anchors = np.asarray(initial_population, dtype=float)
+        if anchors.ndim == 1:
+            return anchors.reshape(1, -1)
+        if anchors.ndim != 2:
+            raise ValueError(f"initial_population must be 1D or 2D, got shape {anchors.shape}")
+        return anchors
+
+    @staticmethod
+    def _resolve_bounds(problem: OptimizationProblem, anchors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if problem.lower_bound is not None and problem.upper_bound is not None:
+            low = np.asarray(problem.lower_bound, dtype=float)
+            high = np.asarray(problem.upper_bound, dtype=float)
+        elif anchors.size:
+            low = np.min(anchors, axis=0)
+            high = np.max(anchors, axis=0)
+            span = np.maximum(high - low, 1.0)
+            low = low - span
+            high = high + span
+        else:
+            raise ValueError("CMA-ES requires bounds or a non-empty initial population.")
+
+        if low.shape != high.shape:
+            raise ValueError(f"Bounds shape mismatch: low={low.shape}, high={high.shape}")
+        span = high - low
+        if np.any(span <= 1e-12):
+            center = 0.5 * (low + high)
+            low = center - 0.5
+            high = center + 0.5
+        return low.astype(float), high.astype(float)
+
+    @staticmethod
+    def _clip_positions_to_bounds(positions: np.ndarray, bounds: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+        values = np.asarray(positions, dtype=float)
+        if values.size == 0:
+            return np.empty((0, bounds[0].size), dtype=float)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        low, high = bounds
+        return np.clip(values, low[None, :], high[None, :])
+
+    @staticmethod
+    def _ranked_seed_anchors(positions: np.ndarray, values: np.ndarray, max_count: int) -> np.ndarray:
+        positions = np.asarray(positions, dtype=float)
+        values = np.asarray(values, dtype=float)
+        if positions.size == 0 or values.size == 0:
+            return positions
+        finite = np.where(np.isfinite(values))[0]
+        if finite.size == 0:
+            return positions[: max(int(max_count), 1)]
+        order = finite[np.argsort(values[finite])]
+        return positions[order[: max(int(max_count), 1)]]
+
+    @staticmethod
+    def _evaluate(problem: OptimizationProblem, position: np.ndarray) -> float:
+        try:
+            value = float(problem.objective(np.asarray(position, dtype=float)))
+        except Exception:
+            return float("inf")
+        if not np.isfinite(value):
+            return float("inf")
+        return value

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spatiotemporal-joint-planner"
+version = "0.1.0"
+description = "Fixed-horizon spatiotemporal joint motion-planning prototype"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "spatiotemporal_joint_planner*",
+]

@@ -1,0 +1,1382 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Sequence
+
+import numpy as np
+
+from spatiotemporal_joint_planner.common import ActorPrediction, CostBreakdown, CostResult, PlanningProblem, Trajectory
+from spatiotemporal_joint_planner.cost.base import CostFunction
+
+
+def shaped_hinge(value, safe: float = 0.0, soft: float = 1.0, tail_gain: float = 0.25, cap: float = 4.0):
+    value = np.maximum(np.asarray(value, dtype=float), 0.0)
+    soft_span = max(float(soft) - float(safe), 1e-6)
+    z = np.maximum((value - float(safe)) / soft_span, 0.0)
+    smooth = z * z * (3.0 - 2.0 * np.minimum(z, 1.0))
+    tail = 1.0 + float(tail_gain) * np.log1p(np.maximum(z - 1.0, 0.0))
+    return np.minimum(np.where(z <= 1.0, smooth, tail), float(cap))
+
+
+def pseudo_huber(x, delta: float = 1.0):
+    x = np.asarray(x, dtype=float) / max(float(delta), 1e-6)
+    return np.sqrt(1.0 + x * x) - 1.0
+
+
+def saturate_cost(value: float, scale: float) -> float:
+    value = max(float(value), 0.0)
+    scale = max(float(scale), 1e-6)
+    return float(value / (value + scale))
+
+
+def topk_mean(values, fraction: float = 0.2) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0
+    k = max(1, int(math.ceil(float(values.size) * float(fraction))))
+    return float(np.mean(np.partition(values, -k)[-k:]))
+
+
+def ranges_overlap(a_min: float, a_max: float, b_min: float, b_max: float) -> bool:
+    return float(a_min) <= float(b_max) and float(b_min) <= float(a_max)
+
+
+@dataclass(frozen=True)
+class ParametricTrajectoryCostConfig:
+    ego_front: float = 4.05
+    ego_rear: float = 0.90
+    ego_width: float = 2.70
+    planning_obstacle_s_buffer: float = 0.5
+    planning_obstacle_l_buffer: float = 0.2
+    road_edge_buffer: float = 1.0
+    min_lateral_accel: float = -2.5
+    max_lateral_accel: float = 2.5
+    lateral_accel_zero_comfort: float = 1.2
+    lateral_accel_zero_weight: float = 0.35
+    min_kappa: float = -0.20
+    max_kappa: float = 0.20
+    kappa_zero_comfort: float = 0.04
+    kappa_zero_weight: float = 0.50
+    min_dkappa: float = -0.08
+    max_dkappa: float = 0.08
+    dkappa_zero_comfort: float = 0.04
+    dkappa_zero_weight: float = 0.50
+    min_lateral_jerk: float = -3.0
+    max_lateral_jerk: float = 3.0
+    lateral_jerk_zero_comfort: float = 1.0
+    lateral_jerk_zero_weight: float = 0.35
+    max_longitudinal_speed: float = 15.0
+    speed_tracking_comfort: float = 2.5
+    collision_score_scale: float = 0.25
+    road_score_scale: float = 0.25
+    dynamic_score_scale: float = 0.10
+    speed_score_scale: float = 0.30
+    efficiency_score_scale: float = 1.0
+    comfort_score_scale: float = 1.0
+    reference_score_scale: float = 1.0
+    trajectory_certificate_enabled: bool = True
+    trajectory_certificate_score_scale: float = 1.0
+    terminal_future_feasibility_weight: float = 0.45
+    terminal_recoverability_weight: float = 0.25
+    terminal_progress_weight: float = 0.20
+    terminal_speed_weight: float = 0.10
+    terminal_tail_time: float = 1.0
+    terminal_future_preview_time: float = 3.0
+    terminal_future_min_preview_distance: float = 15.0
+    terminal_future_max_preview_distance: float = 50.0
+    terminal_future_step_s: float = 1.0
+    terminal_future_slope_delta: float = 0.08
+    terminal_future_min_free_width: float = 1.2
+    terminal_dl_ds_comfort: float = 0.12
+    terminal_kappa_comfort: float = 0.04
+    terminal_dkappa_comfort: float = 0.04
+    terminal_lateral_accel_comfort: float = 1.2
+    terminal_lateral_jerk_comfort: float = 1.0
+    terminal_boundary_clearance_comfort: float = 0.8
+    terminal_speed_comfort: float = 2.5
+    collision_decay_s: float = 12.0
+    efficiency_progress_comfort: float = 8.0
+    reference_lateral_comfort: float = 1.0
+    reference_lateral_time_weight_start: float = 0.3
+    reference_lateral_time_weight_end: float = 1.0
+    reference_obstacle_relief_buffer: float = 12.0
+    reference_obstacle_relief_weight: float = 0.2
+
+
+class ParametricTrajectoryCost(CostFunction):
+    """Hierarchical cost for fixed-horizon parameterized trajectories.
+
+    The scalar is intentionally level-coded: collision terms dominate road
+    boundary terms, road terms dominate dynamic terms, and dynamic terms
+    dominate soft speed tracking.
+    """
+
+    def __init__(self, config: Optional[ParametricTrajectoryCostConfig] = None):
+        self.config = config or ParametricTrajectoryCostConfig()
+
+    @property
+    def name(self) -> str:
+        return "parametric_trajectory_cost"
+
+    def evaluate(self, trajectory: Trajectory, problem: PlanningProblem) -> CostResult:
+        blocked_ranges = self._blocked_ranges(problem)
+        running_terms = self._markov_running_terms(trajectory, problem, blocked_ranges)
+        global_terms = self._global_hierarchy_terms(running_terms)
+        certificate_terms = self._trajectory_level_certificate_terms(trajectory, problem, blocked_ranges)
+
+        collision_flag = global_terms["collision_flag"]
+        collision_cost = global_terms["collision_cost"]
+        road_flag = global_terms["road_flag"]
+        road_cost = global_terms["road_cost"]
+        lateral_accel_flag = global_terms["lateral_accel_flag"]
+        lateral_accel_limit_cost = global_terms["lateral_accel_limit_cost"]
+        lateral_accel_zero_cost = global_terms["lateral_accel_zero_cost"]
+        lateral_accel_score = global_terms["lateral_accel_score"]
+        lateral_accel_hard_score = global_terms["lateral_accel_hard_score"]
+        lateral_accel_soft_score = global_terms["lateral_accel_soft_score"]
+        kappa_flag = global_terms["kappa_flag"]
+        kappa_limit_cost = global_terms["kappa_limit_cost"]
+        kappa_zero_cost = global_terms["kappa_zero_cost"]
+        kappa_score = global_terms["kappa_score"]
+        kappa_hard_score = global_terms["kappa_hard_score"]
+        kappa_soft_score = global_terms["kappa_soft_score"]
+        dkappa_flag = global_terms["dkappa_flag"]
+        dkappa_limit_cost = global_terms["dkappa_limit_cost"]
+        dkappa_zero_cost = global_terms["dkappa_zero_cost"]
+        dkappa_score = global_terms["dkappa_score"]
+        dkappa_hard_score = global_terms["dkappa_hard_score"]
+        dkappa_soft_score = global_terms["dkappa_soft_score"]
+        lateral_jerk_flag = global_terms["lateral_jerk_flag"]
+        lateral_jerk_limit_cost = global_terms["lateral_jerk_limit_cost"]
+        lateral_jerk_zero_cost = global_terms["lateral_jerk_zero_cost"]
+        lateral_jerk_score = global_terms["lateral_jerk_score"]
+        lateral_jerk_hard_score = global_terms["lateral_jerk_hard_score"]
+        lateral_jerk_soft_score = global_terms["lateral_jerk_soft_score"]
+        speed_flag = global_terms["speed_flag"]
+        speed_limit_cost = global_terms["speed_limit_cost"]
+        speed_deviation_cost = global_terms["speed_deviation_cost"]
+        speed_score = global_terms["speed_score"]
+        dynamic_score = global_terms["dynamic_score"]
+        efficiency_cost = global_terms["efficiency_cost"]
+        efficiency_score = global_terms["efficiency_score"]
+        comfort_score = global_terms["comfort_score"]
+        reference_lateral_target = global_terms["reference_lateral_target"]
+        reference_lateral_cost = global_terms["reference_lateral_cost"]
+        reference_score = global_terms["reference_score"]
+        trajectory_certificate_score = certificate_terms["trajectory_certificate_score"]
+        terminal_value_score = certificate_terms["terminal_value_score"]
+
+        collision_score = saturate_cost(collision_cost, self.config.collision_score_scale)
+        road_score = saturate_cost(road_cost, self.config.road_score_scale)
+        hard_hierarchy_cost = float(
+            1.0e9 * collision_score
+            + 1.0e8 * road_score
+            + 1.0e7 * kappa_hard_score
+            + 1.0e6 * dkappa_hard_score
+            + 1.0e5 * lateral_accel_hard_score
+            + 1.0e4 * lateral_jerk_hard_score
+        )
+        soft_hierarchy_cost = float(
+            1.0e3 * efficiency_score
+            + 1.0e2 * comfort_score
+            + 1.0e1 * reference_score
+        )
+        if bool(self.config.trajectory_certificate_enabled):
+            soft_hierarchy_cost = float(
+                1.0e3 * efficiency_score
+                + 1.0e2 * trajectory_certificate_score
+                + 1.0e1 * comfort_score
+                + 1.0e0 * reference_score
+            )
+
+        total = float(hard_hierarchy_cost + soft_hierarchy_cost)
+        terms = {
+            "collision_flag": float(collision_flag),
+            "collision_cost": float(collision_cost),
+            "collision_score": float(collision_score),
+            "road_flag": float(road_flag),
+            "road_cost": float(road_cost),
+            "road_score": float(road_score),
+            "lateral_accel_flag": float(lateral_accel_flag),
+            "lateral_accel_limit_cost": float(lateral_accel_limit_cost),
+            "lateral_accel_zero_cost": float(lateral_accel_zero_cost),
+            "lateral_accel_hard_cost": float(lateral_accel_limit_cost),
+            "lateral_accel_soft_cost": float(lateral_accel_zero_cost),
+            "lateral_accel_hard_score": float(lateral_accel_hard_score),
+            "lateral_accel_soft_score": float(lateral_accel_soft_score),
+            "lateral_accel_score": float(lateral_accel_score),
+            "kappa_flag": float(kappa_flag),
+            "kappa_limit_cost": float(kappa_limit_cost),
+            "kappa_zero_cost": float(kappa_zero_cost),
+            "kappa_hard_cost": float(kappa_limit_cost),
+            "kappa_soft_cost": float(kappa_zero_cost),
+            "kappa_hard_score": float(kappa_hard_score),
+            "kappa_soft_score": float(kappa_soft_score),
+            "kappa_score": float(kappa_score),
+            "dkappa_flag": float(dkappa_flag),
+            "dkappa_limit_cost": float(dkappa_limit_cost),
+            "dkappa_zero_cost": float(dkappa_zero_cost),
+            "dkappa_hard_cost": float(dkappa_limit_cost),
+            "dkappa_soft_cost": float(dkappa_zero_cost),
+            "dkappa_hard_score": float(dkappa_hard_score),
+            "dkappa_soft_score": float(dkappa_soft_score),
+            "dkappa_score": float(dkappa_score),
+            "lateral_jerk_flag": float(lateral_jerk_flag),
+            "lateral_jerk_limit_cost": float(lateral_jerk_limit_cost),
+            "lateral_jerk_zero_cost": float(lateral_jerk_zero_cost),
+            "lateral_jerk_hard_cost": float(lateral_jerk_limit_cost),
+            "lateral_jerk_soft_cost": float(lateral_jerk_zero_cost),
+            "lateral_jerk_hard_score": float(lateral_jerk_hard_score),
+            "lateral_jerk_soft_score": float(lateral_jerk_soft_score),
+            "lateral_jerk_score": float(lateral_jerk_score),
+            "speed_flag": float(speed_flag),
+            "speed_limit_cost": float(speed_limit_cost),
+            "speed_deviation_cost": float(speed_deviation_cost),
+            "speed_max_deviation_cost": float(speed_deviation_cost),
+            "speed_hard_cost": float(speed_limit_cost),
+            "speed_soft_cost": float(speed_deviation_cost),
+            "speed_score": float(speed_score),
+            "speed_tracking_cost": float(speed_deviation_cost),
+            "efficiency_cost": float(efficiency_cost),
+            "efficiency_score": float(efficiency_score),
+            "comfort_score": float(comfort_score),
+            "reference_lateral_cost": float(reference_lateral_cost),
+            "reference_lateral_target": float(reference_lateral_target),
+            "reference_score": float(reference_score),
+            "dynamic_score": float(dynamic_score),
+            "trajectory_certificate_score": float(trajectory_certificate_score),
+            "trajectory_certificate_cost": float(certificate_terms["trajectory_certificate_cost"]),
+            "terminal_value_score": float(terminal_value_score),
+            "terminal_value_cost": float(certificate_terms["terminal_value_cost"]),
+            "terminal_future_feasibility_score": float(certificate_terms["terminal_future_feasibility_score"]),
+            "terminal_recoverability_score": float(certificate_terms["terminal_recoverability_score"]),
+            "terminal_progress_score": float(certificate_terms["terminal_progress_score"]),
+            "terminal_speed_score": float(certificate_terms["terminal_speed_score"]),
+            "terminal_s": float(certificate_terms["terminal_s"]),
+            "terminal_l": float(certificate_terms["terminal_l"]),
+            "terminal_v": float(certificate_terms["terminal_v"]),
+            "terminal_dl_ds": float(certificate_terms["terminal_dl_ds"]),
+            "terminal_future_preview_distance": float(certificate_terms["terminal_future_preview_distance"]),
+            "terminal_future_feasible_progress": float(certificate_terms["terminal_future_feasible_progress"]),
+            "occupation_style_score": float(certificate_terms["occupation_style_score"]),
+            "certificate_slack_score": float(certificate_terms["certificate_slack_score"]),
+            "running_cost": float(global_terms["running_cost"]),
+            "hard_hierarchy_cost": float(hard_hierarchy_cost),
+            "soft_hierarchy_cost": float(soft_hierarchy_cost),
+            "global_hierarchy_cost": float(hard_hierarchy_cost + soft_hierarchy_cost),
+        }
+        hard_violation = bool(
+            collision_flag > 0.0
+            or road_flag > 0.0
+            or lateral_accel_flag > 0.0
+            or kappa_flag > 0.0
+            or dkappa_flag > 0.0
+            or lateral_jerk_flag > 0.0
+            or speed_flag > 0.0
+        )
+        return CostResult(
+            total=total,
+            breakdown=CostBreakdown(terms=terms, hard_violation=hard_violation),
+            feasible=not hard_violation,
+            metadata={
+                "cost": self.name,
+                "blocked_ranges": blocked_ranges,
+                "sort_key": (
+                    round(float(collision_score), 6),
+                    round(float(road_score), 6),
+                    round(float(kappa_hard_score), 6),
+                    round(float(dkappa_hard_score), 6),
+                    round(float(lateral_accel_hard_score), 6),
+                    round(float(lateral_jerk_hard_score), 6),
+                    round(float(trajectory_certificate_score), 6),
+                    round(float(efficiency_score), 6),
+                    round(float(comfort_score), 6),
+                    round(float(reference_score), 6),
+                ),
+            },
+        )
+
+    def _markov_running_terms(
+        self,
+        trajectory: Trajectory,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
+        """Return per-sample Markov-style running costs.
+
+        These arrays are pointwise costs of the current trajectory state and
+        environment at each sample. The hierarchical part of ``evaluate`` may
+        still aggregate them with max/top-k for safety dominance, but the soft
+        objectives are available as additive running costs.
+        """
+
+        terms = {}
+        terms.update(self._collision_running_terms(trajectory, blocked_ranges))
+        terms.update(self._road_running_terms(trajectory, problem))
+        terms.update(self._lateral_accel_running_terms(trajectory))
+        terms.update(self._shape_running_terms(trajectory))
+        terms.update(self._speed_running_terms(trajectory, problem))
+        terms.update(self._reference_lateral_running_terms(trajectory, problem, blocked_ranges))
+        return terms
+
+    def _trajectory_level_certificate_terms(
+        self,
+        trajectory: Trajectory,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
+        """Return non-Markov trajectory-level certificate terms.
+
+        This is intentionally a single entry point so the whole certificate
+        layer can be disabled without touching the Markov safety/dynamics costs.
+        """
+
+        if not bool(self.config.trajectory_certificate_enabled):
+            return self._zero_trajectory_certificate_terms()
+
+        terminal_terms = self._terminal_value_terms(trajectory, problem, blocked_ranges)
+        occupation_terms = self._occupation_style_terms(trajectory, problem, blocked_ranges)
+        slack_terms = self._certificate_slack_terms(trajectory, problem, blocked_ranges)
+
+        certificate_cost = float(
+            terminal_terms["terminal_value_score"]
+            + occupation_terms["occupation_style_score"]
+            + slack_terms["certificate_slack_score"]
+        )
+        certificate_score = float(
+            np.clip(certificate_cost / max(float(self.config.trajectory_certificate_score_scale), 1e-6), 0.0, 1.0)
+        )
+        terms = {
+            "trajectory_certificate_cost": certificate_cost,
+            "trajectory_certificate_score": certificate_score,
+        }
+        terms.update(terminal_terms)
+        terms.update(occupation_terms)
+        terms.update(slack_terms)
+        return terms
+
+    @staticmethod
+    def _zero_trajectory_certificate_terms() -> dict:
+        return {
+            "trajectory_certificate_cost": 0.0,
+            "trajectory_certificate_score": 0.0,
+            "terminal_value_cost": 0.0,
+            "terminal_value_score": 0.0,
+            "terminal_future_feasibility_score": 0.0,
+            "terminal_recoverability_score": 0.0,
+            "terminal_progress_score": 0.0,
+            "terminal_speed_score": 0.0,
+            "terminal_s": 0.0,
+            "terminal_l": 0.0,
+            "terminal_v": 0.0,
+            "terminal_dl_ds": 0.0,
+            "terminal_future_preview_distance": 0.0,
+            "terminal_future_feasible_progress": 0.0,
+            "occupation_style_score": 0.0,
+            "certificate_slack_score": 0.0,
+        }
+
+    def _terminal_value_terms(
+        self,
+        trajectory: Trajectory,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
+        terminal = self._terminal_state_features(trajectory)
+        if terminal is None:
+            terms = self._zero_trajectory_certificate_terms()
+            terms.update(
+                {
+                    "terminal_value_cost": 1.0,
+                    "terminal_value_score": 1.0,
+                    "terminal_future_feasibility_score": 1.0,
+                    "terminal_recoverability_score": 1.0,
+                    "terminal_progress_score": 1.0,
+                    "terminal_speed_score": 1.0,
+                }
+            )
+            return {key: terms[key] for key in terms if key.startswith("terminal_")}
+
+        s_t = float(terminal["s"])
+        l_t = float(terminal["l"])
+        v_t = max(float(terminal["v"]), 0.0)
+        dl_ds_t = float(terminal["dl_ds"])
+        preview_distance = float(
+            np.clip(
+                v_t * max(float(self.config.terminal_future_preview_time), 0.0),
+                max(float(self.config.terminal_future_min_preview_distance), 0.0),
+                max(float(self.config.terminal_future_max_preview_distance), 1e-6),
+            )
+        )
+
+        future_score, feasible_progress = self._terminal_future_rollout_score(
+            s_t=s_t,
+            l_t=l_t,
+            dl_ds_t=dl_ds_t,
+            preview_distance=preview_distance,
+            problem=problem,
+            blocked_ranges=blocked_ranges,
+        )
+        recoverability_score = self._terminal_recoverability_score(terminal, problem)
+        progress_shortfall = max(preview_distance - feasible_progress, 0.0)
+        progress_score = self._unit_hinge_score(progress_shortfall, soft=max(preview_distance, 1.0))
+        target_speed = self._target_speed(problem)
+        speed_shortfall = max(float(target_speed) - v_t, 0.0)
+        speed_score = self._unit_pseudo_huber_score(speed_shortfall, comfort=float(self.config.terminal_speed_comfort))
+
+        terminal_value_score = self._weighted_unit_score(
+            [
+                (future_score, self.config.terminal_future_feasibility_weight),
+                (recoverability_score, self.config.terminal_recoverability_weight),
+                (progress_score, self.config.terminal_progress_weight),
+                (speed_score, self.config.terminal_speed_weight),
+            ]
+        )
+        return {
+            "terminal_value_cost": float(terminal_value_score),
+            "terminal_value_score": float(terminal_value_score),
+            "terminal_future_feasibility_score": float(future_score),
+            "terminal_recoverability_score": float(recoverability_score),
+            "terminal_progress_score": float(progress_score),
+            "terminal_speed_score": float(speed_score),
+            "terminal_s": s_t,
+            "terminal_l": l_t,
+            "terminal_v": v_t,
+            "terminal_dl_ds": dl_ds_t,
+            "terminal_future_preview_distance": preview_distance,
+            "terminal_future_feasible_progress": float(feasible_progress),
+        }
+
+    def _occupation_style_terms(
+        self,
+        trajectory: Trajectory,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
+        del trajectory, problem, blocked_ranges
+        return {"occupation_style_score": 0.0}
+
+    def _certificate_slack_terms(
+        self,
+        trajectory: Trajectory,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
+        del trajectory, problem, blocked_ranges
+        return {"certificate_slack_score": 0.0}
+
+    def _terminal_state_features(self, trajectory: Trajectory) -> Optional[dict]:
+        s_values = np.asarray(trajectory.s, dtype=float).reshape(-1)
+        l_values = np.asarray(trajectory.l, dtype=float).reshape(-1)
+        n = min(s_values.size, l_values.size)
+        if n == 0:
+            return None
+
+        finite = np.isfinite(s_values[:n]) & np.isfinite(l_values[:n])
+        if not np.any(finite):
+            return None
+        idx = int(np.where(finite)[0][-1])
+        s_t = float(s_values[idx])
+        l_t = float(l_values[idx])
+        dl_ds_t = self._terminal_dl_ds(trajectory, idx)
+        v_t = self._trajectory_speed_at_index(trajectory, idx)
+        kappa_t = self._last_finite(trajectory.kappa, default=0.0)
+        dkappa_t = self._last_finite(self._dkappa_values(trajectory), default=0.0)
+        lateral_accel_t = self._last_finite(self._lateral_acceleration_values(trajectory), default=0.0)
+        lateral_jerk_t = self._last_finite(self._lateral_jerk_values(trajectory), default=0.0)
+        return {
+            "s": s_t,
+            "l": l_t,
+            "dl_ds": dl_ds_t,
+            "v": v_t,
+            "kappa": kappa_t,
+            "dkappa": dkappa_t,
+            "lateral_accel": lateral_accel_t,
+            "lateral_jerk": lateral_jerk_t,
+        }
+
+    def _terminal_dl_ds(self, trajectory: Trajectory, terminal_idx: int) -> float:
+        s_values = np.asarray(trajectory.s, dtype=float).reshape(-1)
+        l_values = np.asarray(trajectory.l, dtype=float).reshape(-1)
+        n = min(s_values.size, l_values.size, int(terminal_idx) + 1)
+        if n < 2:
+            return self._velocity_dl_ds(trajectory, terminal_idx)
+
+        indices = np.arange(n, dtype=int)
+        if trajectory.t is not None:
+            t_values = np.asarray(trajectory.t, dtype=float).reshape(-1)
+            if t_values.size >= n and np.isfinite(t_values[terminal_idx]):
+                tail_time = max(float(self.config.terminal_tail_time), 0.0)
+                indices = indices[t_values[:n] >= float(t_values[terminal_idx]) - tail_time]
+        if indices.size < 2:
+            indices = np.arange(max(0, n - min(n, 10)), n, dtype=int)
+
+        s_tail = s_values[indices]
+        l_tail = l_values[indices]
+        finite = np.isfinite(s_tail) & np.isfinite(l_tail)
+        if np.count_nonzero(finite) >= 2:
+            s_tail = s_tail[finite]
+            l_tail = l_tail[finite]
+            if float(np.max(s_tail) - np.min(s_tail)) > 1e-6:
+                try:
+                    return float(np.polyfit(s_tail, l_tail, deg=1)[0])
+                except (ValueError, np.linalg.LinAlgError):
+                    pass
+
+        if n >= 2 and np.isfinite(s_values[n - 1]) and np.isfinite(s_values[n - 2]):
+            ds = float(s_values[n - 1] - s_values[n - 2])
+            if abs(ds) > 1e-6:
+                return float((l_values[n - 1] - l_values[n - 2]) / ds)
+        return self._velocity_dl_ds(trajectory, terminal_idx)
+
+    @staticmethod
+    def _velocity_dl_ds(trajectory: Trajectory, idx: int) -> float:
+        if trajectory.s_v is None or trajectory.l_v is None:
+            return 0.0
+        s_v = np.asarray(trajectory.s_v, dtype=float).reshape(-1)
+        l_v = np.asarray(trajectory.l_v, dtype=float).reshape(-1)
+        if idx >= s_v.size or idx >= l_v.size:
+            return 0.0
+        if not np.isfinite(s_v[idx]) or abs(float(s_v[idx])) < 1e-6 or not np.isfinite(l_v[idx]):
+            return 0.0
+        return float(l_v[idx] / s_v[idx])
+
+    def _trajectory_speed_at_index(self, trajectory: Trajectory, idx: int) -> float:
+        if trajectory.s_v is not None:
+            s_v = np.asarray(trajectory.s_v, dtype=float).reshape(-1)
+            if idx < s_v.size and np.isfinite(s_v[idx]):
+                return float(s_v[idx])
+        if trajectory.v is not None:
+            v = np.asarray(trajectory.v, dtype=float).reshape(-1)
+            if idx < v.size and np.isfinite(v[idx]):
+                return float(v[idx])
+        if trajectory.s_v is not None and trajectory.l_v is not None:
+            s_v = np.asarray(trajectory.s_v, dtype=float).reshape(-1)
+            l_v = np.asarray(trajectory.l_v, dtype=float).reshape(-1)
+            if idx < s_v.size and idx < l_v.size and np.isfinite(s_v[idx]) and np.isfinite(l_v[idx]):
+                return float(math.hypot(float(s_v[idx]), float(l_v[idx])))
+        return 0.0
+
+    def _terminal_recoverability_score(self, terminal: dict, problem: PlanningProblem) -> float:
+        center_right, center_left = self._center_lateral_interval(problem)
+        boundary_clearance = min(float(terminal["l"]) - center_right, center_left - float(terminal["l"]))
+        boundary_score = self._unit_hinge_score(
+            float(self.config.terminal_boundary_clearance_comfort) - boundary_clearance,
+            soft=max(float(self.config.terminal_boundary_clearance_comfort), 1e-6),
+        )
+        return self._weighted_unit_score(
+            [
+                (
+                    self._unit_pseudo_huber_score(abs(float(terminal["dl_ds"])), self.config.terminal_dl_ds_comfort),
+                    1.0,
+                ),
+                (
+                    self._unit_pseudo_huber_score(abs(float(terminal["kappa"])), self.config.terminal_kappa_comfort),
+                    1.0,
+                ),
+                (
+                    self._unit_pseudo_huber_score(abs(float(terminal["dkappa"])), self.config.terminal_dkappa_comfort),
+                    1.0,
+                ),
+                (
+                    self._unit_pseudo_huber_score(
+                        abs(float(terminal["lateral_accel"])), self.config.terminal_lateral_accel_comfort
+                    ),
+                    1.0,
+                ),
+                (
+                    self._unit_pseudo_huber_score(
+                        abs(float(terminal["lateral_jerk"])), self.config.terminal_lateral_jerk_comfort
+                    ),
+                    1.0,
+                ),
+                (boundary_score, 1.0),
+            ]
+        )
+
+    def _terminal_future_rollout_score(
+        self,
+        s_t: float,
+        l_t: float,
+        dl_ds_t: float,
+        preview_distance: float,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> tuple[float, float]:
+        preview_distance = max(float(preview_distance), 0.0)
+        if preview_distance <= 1e-6:
+            return 0.0, 0.0
+
+        step_s = max(float(self.config.terminal_future_step_s), 0.25)
+        distances = np.arange(step_s, preview_distance + 0.5 * step_s, step_s, dtype=float)
+        if distances.size == 0:
+            distances = np.array([preview_distance], dtype=float)
+
+        slope_delta = max(float(self.config.terminal_future_slope_delta), 0.0)
+        slope_targets = [float(dl_ds_t), 0.0, float(dl_ds_t) + slope_delta, float(dl_ds_t) - slope_delta]
+        slope_targets = list(dict.fromkeys(round(value, 6) for value in slope_targets))
+
+        best_score = 1.0
+        best_feasible_progress = 0.0
+        for target_slope in slope_targets:
+            sample_scores = []
+            feasible_progress = preview_distance
+            hard_blocked = False
+            for distance in distances:
+                d = min(float(distance), preview_distance)
+                s_hat = float(s_t) + d
+                l_hat = float(l_t) + float(dl_ds_t) * d + 0.5 * (float(target_slope) - float(dl_ds_t)) * (
+                    d * d / max(preview_distance, 1e-6)
+                )
+                sample_score, hard_violation = self._terminal_future_sample_score(
+                    s_hat=s_hat,
+                    l_hat=l_hat,
+                    problem=problem,
+                    blocked_ranges=blocked_ranges,
+                )
+                sample_scores.append(sample_score)
+                if hard_violation and not hard_blocked:
+                    feasible_progress = max(d - step_s, 0.0)
+                    hard_blocked = True
+            primitive_score = self._topk_max_cost(np.asarray(sample_scores, dtype=float), fraction=0.2)
+            best_score = min(best_score, primitive_score)
+            best_feasible_progress = max(best_feasible_progress, feasible_progress)
+
+        return float(np.clip(best_score, 0.0, 1.0)), float(np.clip(best_feasible_progress, 0.0, preview_distance))
+
+    def _terminal_future_sample_score(
+        self,
+        s_hat: float,
+        l_hat: float,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> tuple[float, bool]:
+        center_right, center_left = self._center_lateral_interval(problem)
+        if center_left <= center_right:
+            return 1.0, True
+
+        if float(l_hat) < center_right or float(l_hat) > center_left:
+            return 1.0, True
+
+        hard_collision = self._center_overlaps_blocked(float(s_hat), float(l_hat), blocked_ranges)
+        if hard_collision:
+            return 1.0, True
+
+        intervals = self._free_lateral_intervals_at_s(float(s_hat), problem, blocked_ranges)
+        containing_width = self._containing_interval_width(intervals, float(l_hat))
+        if containing_width <= 0.0:
+            return 1.0, True
+
+        road_width = max(center_left - center_right, 1e-6)
+        desired_width = min(float(self.config.terminal_future_min_free_width), max(0.3 * road_width, 0.5))
+        space_score = self._unit_hinge_score(desired_width - containing_width, soft=max(desired_width, 1e-6))
+
+        edge_clearance = min(float(l_hat) - center_right, center_left - float(l_hat))
+        edge_score = 0.2 * self._unit_hinge_score(
+            float(self.config.terminal_boundary_clearance_comfort) - edge_clearance,
+            soft=max(float(self.config.terminal_boundary_clearance_comfort), 1e-6),
+        )
+        return float(np.clip(max(space_score, edge_score), 0.0, 1.0)), False
+
+    def _center_lateral_interval(self, problem: PlanningProblem) -> tuple[float, float]:
+        half_width = 0.5 * float(self.config.ego_width)
+        left = max(float(problem.road_boundary.left_l), float(problem.road_boundary.right_l))
+        right = min(float(problem.road_boundary.left_l), float(problem.road_boundary.right_l))
+        return right + half_width, left - half_width
+
+    def _free_lateral_intervals_at_s(
+        self,
+        s_value: float,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> list[tuple[float, float]]:
+        center_right, center_left = self._center_lateral_interval(problem)
+        if center_left <= center_right:
+            return []
+
+        intervals = [(center_right, center_left)]
+        ego_s_min = float(s_value) - float(self.config.ego_rear)
+        ego_s_max = float(s_value) + float(self.config.ego_front)
+        half_width = 0.5 * float(self.config.ego_width)
+        for blocked in blocked_ranges:
+            if not ranges_overlap(ego_s_min, ego_s_max, float(blocked["s_min"]), float(blocked["s_max"])):
+                continue
+            blocked_l_min = float(blocked["l_min"]) - half_width
+            blocked_l_max = float(blocked["l_max"]) + half_width
+            next_intervals = []
+            for interval_min, interval_max in intervals:
+                if not ranges_overlap(interval_min, interval_max, blocked_l_min, blocked_l_max):
+                    next_intervals.append((interval_min, interval_max))
+                    continue
+                if blocked_l_min > interval_min:
+                    next_intervals.append((interval_min, min(blocked_l_min, interval_max)))
+                if blocked_l_max < interval_max:
+                    next_intervals.append((max(blocked_l_max, interval_min), interval_max))
+            intervals = [(a, b) for a, b in next_intervals if b - a > 1e-6]
+            if not intervals:
+                break
+        return intervals
+
+    def _center_overlaps_blocked(self, s_value: float, l_value: float, blocked_ranges: Sequence[dict]) -> bool:
+        ego_s_min, ego_s_max, ego_l_min, ego_l_max = self._ego_frenet_range(float(s_value), float(l_value))
+        for blocked in blocked_ranges:
+            if ranges_overlap(ego_s_min, ego_s_max, blocked["s_min"], blocked["s_max"]) and ranges_overlap(
+                ego_l_min, ego_l_max, blocked["l_min"], blocked["l_max"]
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _containing_interval_width(intervals: Sequence[tuple[float, float]], l_value: float) -> float:
+        for interval_min, interval_max in intervals:
+            if float(interval_min) <= float(l_value) <= float(interval_max):
+                return float(interval_max) - float(interval_min)
+        return 0.0
+
+    @staticmethod
+    def _unit_hinge_score(value: float, soft: float) -> float:
+        return float(np.clip(shaped_hinge(max(float(value), 0.0), safe=0.0, soft=max(float(soft), 1e-6), cap=1.0), 0.0, 1.0))
+
+    @staticmethod
+    def _unit_pseudo_huber_score(value: float, comfort: float) -> float:
+        raw = float(pseudo_huber(float(value) / max(float(comfort), 1e-6), delta=1.0))
+        return float(np.clip(raw / (raw + 1.0), 0.0, 1.0))
+
+    @staticmethod
+    def _weighted_unit_score(weighted_scores: Sequence[tuple[float, float]]) -> float:
+        total_weight = 0.0
+        total_score = 0.0
+        for score, weight in weighted_scores:
+            weight = max(float(weight), 0.0)
+            if weight <= 0.0:
+                continue
+            total_weight += weight
+            total_score += weight * float(np.clip(float(score), 0.0, 1.0))
+        if total_weight <= 1e-9:
+            return 0.0
+        return float(np.clip(total_score / total_weight, 0.0, 1.0))
+
+    def _global_hierarchy_terms(self, running_terms: dict) -> dict:
+        collision_running = self._finite_array(running_terms.get("collision_running"))
+        collision_overlap = self._finite_array(running_terms.get("collision_overlap"))
+        road_running = self._finite_array(running_terms.get("road_running"))
+        road_violation = self._finite_array(running_terms.get("road_violation"))
+        lateral_limit = self._finite_array(running_terms.get("lateral_accel_limit_running"))
+        lateral_zero = self._finite_array(running_terms.get("lateral_accel_zero_running"))
+        lateral_violation = self._finite_array(running_terms.get("lateral_accel_violation"))
+        kappa_limit = self._finite_array(running_terms.get("kappa_limit_running"))
+        kappa_zero = self._finite_array(running_terms.get("kappa_zero_running"))
+        kappa_violation = self._finite_array(running_terms.get("kappa_violation"))
+        dkappa_limit = self._finite_array(running_terms.get("dkappa_limit_running"))
+        dkappa_zero = self._finite_array(running_terms.get("dkappa_zero_running"))
+        dkappa_violation = self._finite_array(running_terms.get("dkappa_violation"))
+        lateral_jerk_limit = self._finite_array(running_terms.get("lateral_jerk_limit_running"))
+        lateral_jerk_zero = self._finite_array(running_terms.get("lateral_jerk_zero_running"))
+        lateral_jerk_violation = self._finite_array(running_terms.get("lateral_jerk_violation"))
+        speed_limit = self._finite_array(running_terms.get("speed_limit_running"))
+        speed_tracking = self._finite_array(running_terms.get("speed_max_deviation_running"))
+        if speed_tracking.size == 0:
+            speed_tracking = self._finite_array(running_terms.get("speed_tracking_running"))
+        speed_efficiency = self._finite_array(running_terms.get("efficiency_running"))
+        speed_violation = self._finite_array(running_terms.get("speed_violation"))
+        reference_lateral = self._finite_array(running_terms.get("reference_lateral_running"))
+
+        collision_cost = self._topk_max_cost(collision_running, fraction=0.15)
+        road_cost = self._topk_max_cost(road_running, fraction=0.15)
+        lateral_accel_limit_cost = float(np.mean(lateral_limit)) if lateral_limit.size else 4.0
+        kappa_limit_cost = float(np.mean(kappa_limit)) if kappa_limit.size else 4.0
+        dkappa_limit_cost = float(np.mean(dkappa_limit)) if dkappa_limit.size else 4.0
+        lateral_jerk_limit_cost = float(np.mean(lateral_jerk_limit)) if lateral_jerk_limit.size else 4.0
+        speed_limit_cost = float(np.mean(speed_limit)) if speed_limit.size else 4.0
+        lateral_accel_zero_cost = float(np.mean(lateral_zero)) if lateral_zero.size else 4.0
+        kappa_zero_cost = float(np.mean(kappa_zero)) if kappa_zero.size else 4.0
+        dkappa_zero_cost = float(np.mean(dkappa_zero)) if dkappa_zero.size else 4.0
+        lateral_jerk_zero_cost = float(np.mean(lateral_jerk_zero)) if lateral_jerk_zero.size else 4.0
+        speed_deviation_cost = float(np.mean(speed_tracking)) if speed_tracking.size else 4.0
+        efficiency_cost = float(np.mean(speed_efficiency)) if speed_efficiency.size else 4.0
+        reference_lateral_cost = float(np.mean(reference_lateral)) if reference_lateral.size else 0.0
+        lateral_accel_hard_score = saturate_cost(lateral_accel_limit_cost, self.config.dynamic_score_scale)
+        kappa_hard_score = saturate_cost(kappa_limit_cost, self.config.dynamic_score_scale)
+        dkappa_hard_score = saturate_cost(dkappa_limit_cost, self.config.dynamic_score_scale)
+        lateral_jerk_hard_score = saturate_cost(lateral_jerk_limit_cost, self.config.dynamic_score_scale)
+        lateral_accel_soft_score = saturate_cost(lateral_accel_zero_cost, self.config.comfort_score_scale)
+        kappa_soft_score = saturate_cost(kappa_zero_cost, self.config.comfort_score_scale)
+        dkappa_soft_score = saturate_cost(dkappa_zero_cost, self.config.comfort_score_scale)
+        lateral_jerk_soft_score = saturate_cost(lateral_jerk_zero_cost, self.config.comfort_score_scale)
+        speed_score = saturate_cost(speed_limit_cost + speed_deviation_cost, self.config.speed_score_scale)
+        efficiency_score = saturate_cost(efficiency_cost + speed_deviation_cost, self.config.efficiency_score_scale)
+        comfort_score = self._mean_score(
+            [lateral_accel_soft_score, kappa_soft_score, dkappa_soft_score, lateral_jerk_soft_score]
+        )
+        reference_score = saturate_cost(reference_lateral_cost, self.config.reference_score_scale)
+        lateral_accel_score = self._mean_score([lateral_accel_hard_score, lateral_accel_soft_score])
+        kappa_score = self._mean_score([kappa_hard_score, kappa_soft_score])
+        dkappa_score = self._mean_score([dkappa_hard_score, dkappa_soft_score])
+        lateral_jerk_score = self._mean_score([lateral_jerk_hard_score, lateral_jerk_soft_score])
+        dynamic_score = float(
+            kappa_hard_score + dkappa_hard_score + lateral_accel_hard_score + lateral_jerk_hard_score
+        )
+
+        running_cost = float(
+            1.0e7 * kappa_hard_score
+            + 1.0e6 * dkappa_hard_score
+            + 1.0e5 * lateral_accel_hard_score
+            + 1.0e4 * lateral_jerk_hard_score
+            + 1.0e3 * efficiency_score
+            + 1.0e2 * comfort_score
+            + 1.0e1 * reference_score
+        )
+        return {
+            "collision_flag": float(np.max(collision_overlap) > 0.0) if collision_overlap.size else 0.0,
+            "collision_cost": collision_cost,
+            "road_flag": float(np.max(road_violation) > 0.0) if road_violation.size else 0.0,
+            "road_cost": road_cost,
+            "lateral_accel_flag": float(np.max(lateral_violation) > 0.0) if lateral_violation.size else 0.0,
+            "lateral_accel_limit_cost": lateral_accel_limit_cost,
+            "lateral_accel_zero_cost": lateral_accel_zero_cost,
+            "lateral_accel_hard_score": lateral_accel_hard_score,
+            "lateral_accel_soft_score": lateral_accel_soft_score,
+            "lateral_accel_score": lateral_accel_score,
+            "kappa_flag": float(np.max(kappa_violation) > 0.0) if kappa_violation.size else 0.0,
+            "kappa_limit_cost": kappa_limit_cost,
+            "kappa_zero_cost": kappa_zero_cost,
+            "kappa_hard_score": kappa_hard_score,
+            "kappa_soft_score": kappa_soft_score,
+            "kappa_score": kappa_score,
+            "dkappa_flag": float(np.max(dkappa_violation) > 0.0) if dkappa_violation.size else 0.0,
+            "dkappa_limit_cost": dkappa_limit_cost,
+            "dkappa_zero_cost": dkappa_zero_cost,
+            "dkappa_hard_score": dkappa_hard_score,
+            "dkappa_soft_score": dkappa_soft_score,
+            "dkappa_score": dkappa_score,
+            "lateral_jerk_flag": float(np.max(lateral_jerk_violation) > 0.0) if lateral_jerk_violation.size else 0.0,
+            "lateral_jerk_limit_cost": lateral_jerk_limit_cost,
+            "lateral_jerk_zero_cost": lateral_jerk_zero_cost,
+            "lateral_jerk_hard_score": lateral_jerk_hard_score,
+            "lateral_jerk_soft_score": lateral_jerk_soft_score,
+            "lateral_jerk_score": lateral_jerk_score,
+            "speed_flag": float(np.max(speed_violation) > 0.0) if speed_violation.size else 0.0,
+            "speed_limit_cost": speed_limit_cost,
+            "speed_deviation_cost": speed_deviation_cost,
+            "speed_score": speed_score,
+            "dynamic_score": dynamic_score,
+            "efficiency_cost": efficiency_cost,
+            "efficiency_score": efficiency_score,
+            "comfort_score": comfort_score,
+            "reference_lateral_target": float(running_terms.get("reference_lateral_target", 0.0)),
+            "reference_lateral_cost": reference_lateral_cost,
+            "reference_score": reference_score,
+            "running_cost": running_cost,
+        }
+
+    def _collision_running_terms(self, trajectory: Trajectory, blocked_ranges: Sequence[dict]) -> dict:
+        s_values = np.asarray(trajectory.s, dtype=float)
+        l_values = np.asarray(trajectory.l, dtype=float)
+        n = min(s_values.size, l_values.size)
+        running = np.zeros((n,), dtype=float)
+        overlap = np.zeros((n,), dtype=float)
+        if n == 0 or not blocked_ranges:
+            return {"collision_running": running, "collision_overlap": overlap}
+
+        start_s = float(s_values[0])
+        for idx, (s, l) in enumerate(zip(s_values[:n], l_values[:n])):
+            ego_s_min, ego_s_max, ego_l_min, ego_l_max = self._ego_frenet_range(float(s), float(l))
+            decay = self._range_decay(float(s) - start_s)
+            sample_cost = 0.0
+            for blocked in blocked_ranges:
+                if ranges_overlap(ego_s_min, ego_s_max, blocked["s_min"], blocked["s_max"]) and ranges_overlap(
+                    ego_l_min, ego_l_max, blocked["l_min"], blocked["l_max"]
+                ):
+                    overlap[idx] = 1.0
+                    s_overlap = min(ego_s_max, blocked["s_max"]) - max(ego_s_min, blocked["s_min"])
+                    l_overlap = min(ego_l_max, blocked["l_max"]) - max(ego_l_min, blocked["l_min"])
+                    penetration = max(min(float(s_overlap), float(l_overlap)), 0.0)
+                    sample_cost = max(
+                        sample_cost,
+                        decay * (1.0 + float(shaped_hinge(penetration, safe=0.0, soft=0.6, tail_gain=0.35, cap=3.0))),
+                    )
+            running[idx] = sample_cost
+        return {"collision_running": running, "collision_overlap": overlap}
+
+    def _road_running_terms(self, trajectory: Trajectory, problem: PlanningProblem) -> dict:
+        l_values = np.asarray(trajectory.l, dtype=float)
+        if l_values.size == 0:
+            return {"road_running": np.array([4.0]), "road_violation": np.array([1.0])}
+
+        half_width = 0.5 * float(self.config.ego_width)
+        left = max(float(problem.road_boundary.left_l), float(problem.road_boundary.right_l))
+        right = min(float(problem.road_boundary.left_l), float(problem.road_boundary.right_l))
+        ego_l_min = l_values - half_width
+        ego_l_max = l_values + half_width
+        left_excess = np.maximum(ego_l_max - left, 0.0)
+        right_excess = np.maximum(right - ego_l_min, 0.0)
+        excess = np.maximum(left_excess, right_excess)
+
+        edge_clearance = np.minimum(left - ego_l_max, ego_l_min - right)
+        edge_pressure = np.maximum(float(self.config.road_edge_buffer) - edge_clearance, 0.0)
+        violation_cost = shaped_hinge(excess, safe=0.0, soft=0.6, tail_gain=0.25, cap=3.0)
+        edge_cost = 0.35 * shaped_hinge(
+            edge_pressure,
+            safe=0.0,
+            soft=max(float(self.config.road_edge_buffer), 1e-3),
+            tail_gain=0.1,
+            cap=1.5,
+        )
+        return {
+            "road_running": np.asarray(violation_cost + edge_cost, dtype=float),
+            "road_violation": np.asarray(excess > 1e-6, dtype=float),
+        }
+
+    def _lateral_accel_running_terms(self, trajectory: Trajectory) -> dict:
+        lat_accel = self._lateral_acceleration_values(trajectory)
+        return self._bounded_zero_running_terms(
+            "lateral_accel",
+            lat_accel,
+            min_value=float(self.config.min_lateral_accel),
+            max_value=float(self.config.max_lateral_accel),
+            zero_comfort=float(self.config.lateral_accel_zero_comfort),
+            zero_weight=float(self.config.lateral_accel_zero_weight),
+        )
+
+    def _shape_running_terms(self, trajectory: Trajectory) -> dict:
+        terms = {}
+        terms.update(
+            self._bounded_zero_running_terms(
+                "kappa",
+                self._kappa_values(trajectory),
+                min_value=float(self.config.min_kappa),
+                max_value=float(self.config.max_kappa),
+                zero_comfort=float(self.config.kappa_zero_comfort),
+                zero_weight=float(self.config.kappa_zero_weight),
+            )
+        )
+        terms.update(
+            self._bounded_zero_running_terms(
+                "dkappa",
+                self._dkappa_values(trajectory),
+                min_value=float(self.config.min_dkappa),
+                max_value=float(self.config.max_dkappa),
+                zero_comfort=float(self.config.dkappa_zero_comfort),
+                zero_weight=float(self.config.dkappa_zero_weight),
+            )
+        )
+        terms.update(
+            self._bounded_zero_running_terms(
+                "lateral_jerk",
+                self._lateral_jerk_values(trajectory),
+                min_value=float(self.config.min_lateral_jerk),
+                max_value=float(self.config.max_lateral_jerk),
+                zero_comfort=float(self.config.lateral_jerk_zero_comfort),
+                zero_weight=float(self.config.lateral_jerk_zero_weight),
+            )
+        )
+        return terms
+
+    def _bounded_zero_running_terms(
+        self,
+        prefix: str,
+        values,
+        min_value: float,
+        max_value: float,
+        zero_comfort: float,
+        zero_weight: float,
+    ) -> dict:
+        values = self._finite_array(values)
+        if values.size == 0:
+            return {
+                f"{prefix}_limit_running": np.array([4.0]),
+                f"{prefix}_zero_running": np.array([4.0]),
+                f"{prefix}_violation": np.array([1.0]),
+            }
+
+        low = min(float(min_value), float(max_value))
+        high = max(float(min_value), float(max_value))
+        lower_excess = np.maximum(low - values, 0.0)
+        upper_excess = np.maximum(values - high, 0.0)
+        excess = np.maximum(lower_excess, upper_excess)
+        limit_scale = max(0.25 * max(abs(low), abs(high)), 1e-6)
+        limit_running = shaped_hinge(excess, safe=0.0, soft=limit_scale, tail_gain=0.35, cap=3.0)
+        zero_running = float(zero_weight) * pseudo_huber(values / max(float(zero_comfort), 1e-6), delta=1.0)
+        return {
+            f"{prefix}_limit_running": np.asarray(limit_running, dtype=float),
+            f"{prefix}_zero_running": np.asarray(zero_running, dtype=float),
+            f"{prefix}_violation": np.asarray(excess > 1e-6, dtype=float),
+        }
+
+    def _speed_running_terms(self, trajectory: Trajectory, problem: PlanningProblem) -> dict:
+        if trajectory.s_v is not None:
+            s_v = np.asarray(trajectory.s_v, dtype=float)
+        elif trajectory.v is not None:
+            s_v = np.asarray(trajectory.v, dtype=float)
+        else:
+            return {
+                "speed_limit_running": np.array([4.0]),
+                "speed_tracking_running": np.array([4.0]),
+                "speed_max_deviation_running": np.array([4.0]),
+                "efficiency_running": np.array([4.0]),
+                "speed_violation": np.array([1.0]),
+            }
+        if s_v.size == 0:
+            return {
+                "speed_limit_running": np.array([4.0]),
+                "speed_tracking_running": np.array([4.0]),
+                "speed_max_deviation_running": np.array([4.0]),
+                "efficiency_running": np.array([4.0]),
+                "speed_violation": np.array([1.0]),
+            }
+
+        max_speed = max(float(self.config.max_longitudinal_speed), 1e-3)
+        comfort = max(float(self.config.speed_tracking_comfort), 1e-3)
+        speed_tracking = pseudo_huber((s_v - max_speed) / comfort, delta=1.0)
+        target_speed = self._target_speed(problem)
+        low_speed_shortfall = np.maximum(float(target_speed) - s_v, 0.0)
+        efficiency_running = pseudo_huber(low_speed_shortfall / comfort, delta=1.0)
+
+        reverse_excess = np.maximum(-s_v, 0.0)
+        speed_excess = np.maximum(s_v - max_speed, 0.0)
+        speed_pressure = shaped_hinge(speed_excess, safe=0.0, soft=1.0, tail_gain=0.35, cap=3.0)
+        reverse_pressure = shaped_hinge(reverse_excess, safe=0.0, soft=0.5, tail_gain=0.35, cap=3.0)
+        return {
+            "speed_limit_running": np.asarray(speed_pressure + reverse_pressure, dtype=float),
+            "speed_tracking_running": np.asarray(speed_tracking, dtype=float),
+            "speed_max_deviation_running": np.asarray(speed_tracking, dtype=float),
+            "efficiency_running": np.asarray(efficiency_running, dtype=float),
+            "speed_violation": np.asarray((reverse_excess > 1e-6) | (speed_excess > 1e-6), dtype=float),
+        }
+
+    def _reference_lateral_running_terms(
+        self,
+        trajectory: Trajectory,
+        problem: PlanningProblem,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
+        l_values = np.asarray(trajectory.l, dtype=float)
+        target = self._reference_lateral_target(problem)
+        if l_values.size == 0:
+            return {"reference_lateral_target": float(target), "reference_lateral_running": np.empty((0,), dtype=float)}
+
+        comfort = max(float(self.config.reference_lateral_comfort), 1e-6)
+        deviation_cost = pseudo_huber((l_values - float(target)) / comfort, delta=1.0)
+        n = l_values.size
+        time_weight = np.linspace(
+            float(self.config.reference_lateral_time_weight_start),
+            float(self.config.reference_lateral_time_weight_end),
+            num=n,
+            dtype=float,
+        )
+        time_weight = np.maximum(time_weight, 0.0)
+
+        relief = np.ones((n,), dtype=float)
+        s_values = np.asarray(trajectory.s, dtype=float)
+        if s_values.size:
+            m = min(n, s_values.size)
+            buffer = max(float(self.config.reference_obstacle_relief_buffer), 0.0)
+            relief_weight = float(np.clip(float(self.config.reference_obstacle_relief_weight), 0.0, 1.0))
+            for blocked in blocked_ranges:
+                near = (s_values[:m] >= float(blocked["s_min"]) - buffer) & (
+                    s_values[:m] <= float(blocked["s_max"]) + buffer
+                )
+                near_indices = np.where(near)[0]
+                if near_indices.size:
+                    relief[near_indices] = np.minimum(relief[near_indices], relief_weight)
+
+        return {
+            "reference_lateral_target": float(target),
+            "reference_lateral_running": np.asarray(time_weight * relief * deviation_cost, dtype=float),
+        }
+
+    @staticmethod
+    def _finite_array(values) -> np.ndarray:
+        if values is None:
+            return np.empty((0,), dtype=float)
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        return arr[np.isfinite(arr)]
+
+    @staticmethod
+    def _last_finite(values, default: float = 0.0) -> float:
+        if values is None:
+            return float(default)
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return float(default)
+        return float(arr[-1])
+
+    @staticmethod
+    def _topk_max_cost(values: np.ndarray, fraction: float) -> float:
+        values = np.asarray(values, dtype=float)
+        if values.size == 0:
+            return 0.0
+        return float(0.7 * topk_mean(values, fraction) + 0.3 * np.max(values))
+
+    @staticmethod
+    def _mean_score(scores: Sequence[float]) -> float:
+        values = np.asarray(scores, dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return 0.0
+        return float(np.clip(np.mean(values), 0.0, 1.0))
+
+    @staticmethod
+    def _reference_lateral_target(problem: PlanningProblem) -> float:
+        metadata = dict(problem.metadata or {})
+        for key in ("preferred_l", "reference_l", "target_lane_l", "target_l", "lane_change_target_l"):
+            if key in metadata:
+                try:
+                    return float(metadata[key])
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
+
+    def _target_speed(self, problem: PlanningProblem) -> float:
+        metadata = dict(problem.metadata or {})
+        for key in ("target_speed", "desired_speed", "speed_limit"):
+            if key in metadata:
+                try:
+                    return min(float(metadata[key]), float(self.config.max_longitudinal_speed))
+                except (TypeError, ValueError):
+                    pass
+        return float(self.config.max_longitudinal_speed)
+
+    def _blocked_ranges(self, problem: PlanningProblem) -> list[dict]:
+        ranges = []
+        for actor in problem.actors:
+            blocked = self._blocked_range_from_metadata(actor)
+            if blocked is None:
+                blocked = self._blocked_range_from_actor_pose(actor, problem)
+            if blocked is not None:
+                ranges.append(self._inflate_blocked_range(blocked))
+        return ranges
+
+    def _inflate_blocked_range(self, blocked: dict) -> dict:
+        s_buffer = max(float(self.config.planning_obstacle_s_buffer), 0.0)
+        l_buffer = max(float(self.config.planning_obstacle_l_buffer), 0.0)
+        inflated = dict(blocked)
+        inflated["s_min"] = float(blocked["s_min"]) - s_buffer
+        inflated["s_max"] = float(blocked["s_max"]) + s_buffer
+        inflated["l_min"] = float(blocked["l_min"]) - l_buffer
+        inflated["l_max"] = float(blocked["l_max"]) + l_buffer
+        inflated["planning_s_buffer"] = s_buffer
+        inflated["planning_l_buffer"] = l_buffer
+        return inflated
+
+    @staticmethod
+    def _blocked_range_from_metadata(actor: ActorPrediction) -> Optional[dict]:
+        metadata = dict(actor.metadata or {})
+        keys = ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")
+        if all(key in metadata for key in keys):
+            return {
+                "s_min": float(metadata["blocked_s_min"]),
+                "s_max": float(metadata["blocked_s_max"]),
+                "l_min": float(metadata["blocked_l_min"]),
+                "l_max": float(metadata["blocked_l_max"]),
+                "actor_id": actor.actor_id,
+            }
+        if "s" in metadata and "l" in metadata:
+            half_length = 0.5 * float(actor.length)
+            half_width = 0.5 * float(actor.width)
+            return {
+                "s_min": float(metadata["s"]) - half_length,
+                "s_max": float(metadata["s"]) + half_length,
+                "l_min": float(metadata["l"]) - half_width,
+                "l_max": float(metadata["l"]) + half_width,
+                "actor_id": actor.actor_id,
+            }
+        return None
+
+    def _blocked_range_from_actor_pose(self, actor: ActorPrediction, problem: PlanningProblem) -> Optional[dict]:
+        x_values = np.asarray(actor.x, dtype=float)
+        y_values = np.asarray(actor.y, dtype=float)
+        yaw_values = np.asarray(actor.yaw, dtype=float)
+        if x_values.size == 0 or y_values.size == 0:
+            return None
+        x = float(x_values[0])
+        y = float(y_values[0])
+        yaw = float(yaw_values[0]) if yaw_values.size else 0.0
+        half_l = 0.5 * float(actor.length)
+        half_w = 0.5 * float(actor.width)
+        local = np.array(
+            [
+                [half_l, half_w],
+                [half_l, -half_w],
+                [-half_l, -half_w],
+                [-half_l, half_w],
+            ],
+            dtype=float,
+        )
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        corners = np.column_stack([x + local[:, 0] * c - local[:, 1] * s, y + local[:, 0] * s + local[:, 1] * c])
+        projected_s, projected_l = self._project_points_to_sl(corners, problem)
+        if projected_s.size == 0 or projected_l.size == 0:
+            return None
+        return {
+            "s_min": float(np.min(projected_s)),
+            "s_max": float(np.max(projected_s)),
+            "l_min": float(np.min(projected_l)),
+            "l_max": float(np.max(projected_l)),
+            "actor_id": actor.actor_id,
+        }
+
+    def _project_points_to_sl(self, points: np.ndarray, problem: PlanningProblem) -> tuple[np.ndarray, np.ndarray]:
+        ref_path = problem.ref_path
+        points = np.asarray(points, dtype=float)
+        if points.size == 0:
+            return np.empty((0,), dtype=float), np.empty((0,), dtype=float)
+        if not hasattr(ref_path, "calc_position") or not hasattr(ref_path, "calc_yaw"):
+            return points[:, 0].copy(), points[:, 1].copy()
+
+        if hasattr(ref_path, "s"):
+            ref_s = np.asarray(ref_path.s, dtype=float)
+        else:
+            ref_s = np.arange(0.0, 300.0, 0.5, dtype=float)
+        if ref_s.size == 0:
+            return np.empty((0,), dtype=float), np.empty((0,), dtype=float)
+
+        ref_xy = []
+        ref_yaw = []
+        valid_s = []
+        for s_value in ref_s:
+            xy = ref_path.calc_position(float(s_value))
+            if xy is None or xy[0] is None or xy[1] is None:
+                continue
+            ref_xy.append([float(xy[0]), float(xy[1])])
+            ref_yaw.append(float(ref_path.calc_yaw(float(s_value))))
+            valid_s.append(float(s_value))
+        if not ref_xy:
+            return np.empty((0,), dtype=float), np.empty((0,), dtype=float)
+
+        ref_xy = np.asarray(ref_xy, dtype=float)
+        ref_yaw = np.asarray(ref_yaw, dtype=float)
+        valid_s = np.asarray(valid_s, dtype=float)
+        out_s = []
+        out_l = []
+        for point in points:
+            diff = ref_xy - point[None, :]
+            idx = int(np.argmin(np.sum(diff * diff, axis=1)))
+            yaw = float(ref_yaw[idx])
+            nx = math.cos(yaw + math.pi / 2.0)
+            ny = math.sin(yaw + math.pi / 2.0)
+            lateral = float((point[0] - ref_xy[idx, 0]) * nx + (point[1] - ref_xy[idx, 1]) * ny)
+            out_s.append(float(valid_s[idx]))
+            out_l.append(lateral)
+        return np.asarray(out_s, dtype=float), np.asarray(out_l, dtype=float)
+
+    def _ego_frenet_range(self, s: float, l: float) -> tuple[float, float, float, float]:
+        return (
+            float(s) - float(self.config.ego_rear),
+            float(s) + float(self.config.ego_front),
+            float(l) - 0.5 * float(self.config.ego_width),
+            float(l) + 0.5 * float(self.config.ego_width),
+        )
+
+    def _range_decay(self, s_rel: float) -> float:
+        return float(0.2 + 0.8 * math.exp(-max(float(s_rel), 0.0) / max(float(self.config.collision_decay_s), 1e-3)))
+
+    @staticmethod
+    def _kappa_values(trajectory: Trajectory) -> np.ndarray:
+        if trajectory.kappa is None:
+            return np.empty((0,), dtype=float)
+        kappa = np.asarray(trajectory.kappa, dtype=float).reshape(-1)
+        return kappa[np.isfinite(kappa)]
+
+    def _dkappa_values(self, trajectory: Trajectory) -> np.ndarray:
+        if trajectory.kappa is None:
+            return np.empty((0,), dtype=float)
+        kappa = np.asarray(trajectory.kappa, dtype=float).reshape(-1)
+        if kappa.size < 2:
+            return np.empty((0,), dtype=float)
+        coordinate = self._path_coordinate_values(trajectory, kappa.size)
+        n = min(kappa.size, coordinate.size)
+        if n < 2:
+            return np.empty((0,), dtype=float)
+        values = kappa[:n]
+        coordinate = coordinate[:n]
+        finite = np.isfinite(values) & np.isfinite(coordinate)
+        if np.count_nonzero(finite) < 2:
+            return np.empty((0,), dtype=float)
+        return self._gradient_values(values[finite], coordinate[finite])
+
+    def _lateral_jerk_values(self, trajectory: Trajectory) -> np.ndarray:
+        if trajectory.l_a is None or trajectory.t is None:
+            return np.empty((0,), dtype=float)
+        lateral_accel = np.asarray(trajectory.l_a, dtype=float).reshape(-1)
+        t_values = np.asarray(trajectory.t, dtype=float).reshape(-1)
+        n = min(lateral_accel.size, t_values.size)
+        if n < 2:
+            return np.empty((0,), dtype=float)
+        lateral_accel = lateral_accel[:n]
+        t_values = t_values[:n]
+        finite = np.isfinite(lateral_accel) & np.isfinite(t_values)
+        if np.count_nonzero(finite) < 2:
+            return np.empty((0,), dtype=float)
+        return self._gradient_values(lateral_accel[finite], t_values[finite])
+
+    @staticmethod
+    def _path_coordinate_values(trajectory: Trajectory, size: int) -> np.ndarray:
+        size = max(int(size), 0)
+        if size == 0:
+            return np.empty((0,), dtype=float)
+        if trajectory.x is not None and trajectory.y is not None:
+            x_values = np.asarray(trajectory.x, dtype=float).reshape(-1)
+            y_values = np.asarray(trajectory.y, dtype=float).reshape(-1)
+            n = min(size, x_values.size, y_values.size)
+            if n >= 2:
+                ds = np.hypot(np.diff(x_values[:n]), np.diff(y_values[:n]))
+                return np.concatenate([[0.0], np.cumsum(ds)])
+        if trajectory.s is not None:
+            s_values = np.asarray(trajectory.s, dtype=float).reshape(-1)
+            if s_values.size:
+                return s_values[: min(size, s_values.size)]
+        if trajectory.t is not None:
+            t_values = np.asarray(trajectory.t, dtype=float).reshape(-1)
+            if t_values.size:
+                return t_values[: min(size, t_values.size)]
+        return np.arange(size, dtype=float)
+
+    @staticmethod
+    def _gradient_values(values: np.ndarray, coordinate: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=float).reshape(-1)
+        coordinate = np.asarray(coordinate, dtype=float).reshape(-1)
+        n = min(values.size, coordinate.size)
+        if n < 2:
+            return np.empty((0,), dtype=float)
+        values = values[:n]
+        coordinate = coordinate[:n]
+        if np.any(np.diff(coordinate) <= 1e-6):
+            coordinate = np.arange(n, dtype=float)
+        edge_order = 2 if n >= 3 else 1
+        gradient = np.gradient(values, coordinate, edge_order=edge_order)
+        return np.asarray(gradient, dtype=float)[np.isfinite(gradient)]
+
+    @staticmethod
+    def _lateral_acceleration_values(trajectory: Trajectory) -> np.ndarray:
+        if trajectory.l_a is not None:
+            l_a = np.asarray(trajectory.l_a, dtype=float)
+            if l_a.size:
+                return l_a[np.isfinite(l_a)]
+
+        candidates = []
+        if trajectory.kappa is not None:
+            kappa = np.asarray(trajectory.kappa, dtype=float)
+            if trajectory.v is not None:
+                speed = np.asarray(trajectory.v, dtype=float)
+            elif trajectory.s_v is not None and trajectory.l_v is not None:
+                speed = np.hypot(np.asarray(trajectory.s_v, dtype=float), np.asarray(trajectory.l_v, dtype=float))
+            elif trajectory.s_v is not None:
+                speed = np.abs(np.asarray(trajectory.s_v, dtype=float))
+            else:
+                speed = np.empty((0,), dtype=float)
+            n = min(kappa.size, speed.size)
+            if n:
+                candidates.append(speed[:n] * speed[:n] * kappa[:n])
+        if not candidates:
+            return np.empty((0,), dtype=float)
+        n = min(candidate.size for candidate in candidates)
+        if n == 0:
+            return np.empty((0,), dtype=float)
+        stacked = np.vstack([candidate[:n] for candidate in candidates])
+        idx = np.argmax(np.abs(stacked), axis=0)
+        return stacked[idx, np.arange(n)]
