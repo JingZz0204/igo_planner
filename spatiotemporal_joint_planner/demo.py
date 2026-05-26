@@ -145,6 +145,13 @@ def _build_planner(args, trajectory_model) -> ParametricPlanner:
             elite_fraction=args.elite,
             init_std=args.init_std,
             seed=args.seed,
+            early_stop=not args.disable_early_stop,
+            min_iterations=args.min_iters,
+            convergence_window=args.convergence_window,
+            cost_window_tol=args.cost_window_tol,
+            theta_window_tol=args.theta_window_tol,
+            component_sigma_tol=args.component_sigma_tol,
+            component_weight_tol=args.component_weight_tol,
         )
     )
     cost = ParametricTrajectoryCost(
@@ -475,8 +482,13 @@ def main_simulation(args) -> str:
         if step % max(int(args.log_every), 1) == 0:
             terms = result.cost.breakdown.terms
             theta = np.asarray(result.optimization.best_position, dtype=float) if result.optimization is not None else np.array([])
+            opt_metadata = {} if result.optimization is None else result.optimization.metadata
+            executed_iters = int(opt_metadata.get("executed_iterations", 0))
+            max_iters = int(opt_metadata.get("n_iterations", 0))
+            stop_reason = str(opt_metadata.get("stop_reason", ""))
             print(
                 f"step={step:03d} time={elapsed_ms:8.2f} ms status={result.status:>15s} "
+                f"iter={executed_iters:02d}/{max_iters:02d} stop={stop_reason:<36s} "
                 f"cost={result.cost.total:10.2f} theta={np.round(theta, 3).tolist()} "
                 f"ego_v={_ego_speed(problem.ego):5.2f} exec_v={_trajectory_speed_at(result.trajectory, exec_idx):5.2f} "
                 f"end_v={_trajectory_speed_at(result.trajectory, len(np.asarray(result.trajectory.t, dtype=float)) - 1):5.2f} "
@@ -539,7 +551,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["lattice_trajectory", "bezier_trajectory", "svgd_particle_trajectory"],
         default="lattice_trajectory",
     )
-    parser.add_argument("--max-steps", type=int, default=40)
+    parser.add_argument("--max-steps", type=int, default=150)
     parser.add_argument("--log-every", type=int, default=5)
     parser.add_argument("--planning-dt", type=float, default=0.25)
     parser.add_argument("--horizon", type=float, default=5.0)
@@ -574,10 +586,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-trajectory-certificate", action="store_true")
     parser.add_argument("--components", type=int, default=4)
     parser.add_argument("--samples", type=int, default=64)
-    parser.add_argument("--iters", type=int, default=6)
+    parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--elite", type=float, default=0.25)
     parser.add_argument("--init-std", type=float, default=0.22)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--disable-early-stop", action="store_true")
+    parser.add_argument("--min-iters", type=int, default=3)
+    parser.add_argument("--convergence-window", type=int, default=5)
+    parser.add_argument("--cost-window-tol", type=float, default=1e-3)
+    parser.add_argument("--theta-window-tol", type=float, default=2e-2)
+    parser.add_argument("--component-sigma-tol", type=float, default=0.08)
+    parser.add_argument("--component-weight-tol", type=float, default=0.15)
     parser.add_argument("--max-initial-anchors", type=int, default=96)
     parser.add_argument("--mode-paths", type=int, default=8)
     parser.add_argument("--objective-mode", choices=["auto", "vectorized", "scalar"], default="auto")

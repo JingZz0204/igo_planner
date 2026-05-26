@@ -31,6 +31,13 @@ class CMAESConfig:
     weight_floor: float = 1e-3
     weight_lr: float = 0.55
     seed: int = 0
+    early_stop: bool = True
+    min_iterations: int = 3
+    convergence_window: int = 5
+    cost_window_tol: float = 1e-3
+    theta_window_tol: float = 2e-2
+    component_sigma_tol: float = 0.08
+    component_weight_tol: float = 0.15
 
 
 @dataclass
@@ -70,6 +77,10 @@ class CMAESOptimizer(Optimizer):
         all_positions = []
         all_values = []
         history = []
+        best_value_history = []
+        best_unit_history = []
+        stop_reason = "max_iterations"
+        stop_diagnostics = {}
 
         anchor_positions = self._clip_positions_to_bounds(anchors, bounds)
         if anchor_positions.size:
@@ -84,7 +95,7 @@ class CMAESOptimizer(Optimizer):
 
         state = self._initial_state(bounds, anchors)
 
-        for iteration in range(int(self.config.n_iterations)):
+        for iteration in range(max(int(self.config.n_iterations), 0)):
             unit_samples, component_ids = self._sample_population(state)
             positions = denormalize_parameters(unit_samples, bounds)
             values = self._evaluate_many(problem, positions)
@@ -98,7 +109,26 @@ class CMAESOptimizer(Optimizer):
                 best_position = np.asarray(positions[iter_best_idx], dtype=float).copy()
 
             state = self._update_mixture(state, unit_samples, component_ids, values, iteration)
-            history.append(self._history_item(iteration, state, iter_best_value))
+            if best_position is not None:
+                best_value_history.append(float(best_value))
+                best_unit_history.append(np.clip(normalize_parameters(best_position, bounds), 0.0, 1.0))
+            stop_diagnostics = self._early_stop_diagnostics(best_value_history, best_unit_history, state)
+            early_stop_trigger = self._early_stop_trigger(iteration + 1, stop_diagnostics)
+            should_stop = early_stop_trigger is not None
+            if should_stop:
+                stop_reason = f"early_stop:{early_stop_trigger}"
+            history.append(
+                self._history_item(
+                    iteration=iteration,
+                    state=state,
+                    iteration_best_value=iter_best_value,
+                    global_best_value=best_value,
+                    diagnostics=stop_diagnostics,
+                    stop_reason=stop_reason if should_stop else None,
+                )
+            )
+            if should_stop:
+                break
 
         if best_position is None:
             raise RuntimeError("CMA-ES did not evaluate any samples.")
@@ -120,6 +150,16 @@ class CMAESOptimizer(Optimizer):
                 "n_components": int(self.config.n_components),
                 "n_samples": int(self.config.n_samples),
                 "n_iterations": int(self.config.n_iterations),
+                "executed_iterations": int(len(history)),
+                "stop_reason": stop_reason,
+                "early_stop": bool(self.config.early_stop),
+                "min_iterations": int(self.config.min_iterations),
+                "convergence_window": int(self.config.convergence_window),
+                "cost_window_tol": float(self.config.cost_window_tol),
+                "theta_window_tol": float(self.config.theta_window_tol),
+                "component_sigma_tol": float(self.config.component_sigma_tol),
+                "component_weight_tol": float(self.config.component_weight_tol),
+                **stop_diagnostics,
             },
         )
 
@@ -281,14 +321,100 @@ class CMAESOptimizer(Optimizer):
         weights /= np.sum(weights)
         return weights
 
-    def _history_item(self, iteration: int, state: _MixtureState, best_value: float) -> dict:
-        sigmas = np.asarray([component.sigma for component in state.components], dtype=float)
+    def _history_item(
+        self,
+        iteration: int,
+        state: _MixtureState,
+        iteration_best_value: float,
+        global_best_value: float,
+        diagnostics: dict,
+        stop_reason: Optional[str],
+    ) -> dict:
         return {
             "iteration": int(iteration),
-            "best_value": float(best_value),
+            "best_value": float(iteration_best_value),
+            "iteration_best_value": float(iteration_best_value),
+            "global_best_value": float(global_best_value),
             "weights": state.weights.copy(),
-            "mean_sigma": float(np.sum(state.weights * sigmas)),
+            "mean_sigma": self._mean_sigma(state),
+            "stop_reason": stop_reason,
+            **diagnostics,
         }
+
+    @staticmethod
+    def _mean_sigma(state: _MixtureState) -> float:
+        if not state.components:
+            return 0.0
+        sigmas = np.asarray([component.sigma for component in state.components], dtype=float)
+        weights = np.asarray(state.weights, dtype=float).reshape(-1)
+        if weights.size != sigmas.size or float(np.sum(weights)) <= 1e-12:
+            return float(np.mean(sigmas))
+        weights = weights / np.sum(weights)
+        return float(np.sum(weights * sigmas))
+
+    def _early_stop_diagnostics(
+        self,
+        best_value_history: list[float],
+        best_unit_history: list[np.ndarray],
+        state: _MixtureState,
+    ) -> dict:
+        cost_window_improvement = float("inf")
+        theta_window_shift = float("inf")
+        window = max(int(self.config.convergence_window), 1)
+
+        if len(best_value_history) >= window and len(best_unit_history) >= window:
+            previous_value = float(best_value_history[-window])
+            current_value = float(best_value_history[-1])
+            if np.isfinite(previous_value) and np.isfinite(current_value):
+                denom = max(abs(previous_value), 1.0)
+                cost_window_improvement = max(0.0, previous_value - current_value) / denom
+
+            theta_window = [np.asarray(theta, dtype=float) for theta in best_unit_history[-window:]]
+            if theta_window and all(theta.shape == theta_window[0].shape for theta in theta_window):
+                theta_matrix = np.asarray(theta_window, dtype=float)
+                if theta_matrix.ndim == 2 and theta_matrix.shape[1] > 0:
+                    theta_deltas = np.linalg.norm(np.diff(theta_matrix, axis=0), axis=1) / np.sqrt(
+                        float(theta_matrix.shape[1])
+                    )
+                    theta_window_shift = float(np.max(theta_deltas)) if theta_deltas.size else 0.0
+
+        component_sigma = float("inf")
+        component_weight = 0.0
+        sigmas = np.asarray([component.sigma for component in state.components], dtype=float)
+        weights = np.asarray(state.weights, dtype=float).reshape(-1)
+        if sigmas.size and weights.shape == sigmas.shape:
+            eligible = np.where(weights >= float(self.config.component_weight_tol))[0]
+            if eligible.size:
+                best_idx = int(eligible[np.argmin(sigmas[eligible])])
+                component_sigma = float(sigmas[best_idx])
+                component_weight = float(weights[best_idx])
+
+        return {
+            "cost_window_improvement": float(cost_window_improvement),
+            "theta_window_shift": float(theta_window_shift),
+            "qualified_component_sigma": float(component_sigma),
+            "qualified_component_weight": float(component_weight),
+            "cost_window_converged": float(
+                np.isfinite(cost_window_improvement) and cost_window_improvement <= float(self.config.cost_window_tol)
+            ),
+            "theta_window_converged": float(
+                np.isfinite(theta_window_shift) and theta_window_shift <= float(self.config.theta_window_tol)
+            ),
+            "component_sigma_converged": float(component_sigma <= float(self.config.component_sigma_tol)),
+        }
+
+    def _early_stop_trigger(self, iteration_count: int, diagnostics: dict) -> Optional[str]:
+        if not bool(self.config.early_stop):
+            return None
+        if int(iteration_count) < max(int(self.config.min_iterations), 0):
+            return None
+        if float(diagnostics.get("cost_window_converged", 0.0)) > 0.5:
+            return "cost_window"
+        if float(diagnostics.get("theta_window_converged", 0.0)) > 0.5:
+            return "theta_window"
+        if float(diagnostics.get("component_sigma_converged", 0.0)) > 0.5:
+            return "component_sigma"
+        return None
 
     @staticmethod
     def _component_counts(weights: np.ndarray, total_samples: int) -> np.ndarray:
