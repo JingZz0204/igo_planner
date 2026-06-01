@@ -196,6 +196,7 @@ class StaticNudgeScenario(Scenario):
         lane_width: float = 3.6,
         default_start_l: float = 2.0,
         target_speed: float = 30.0 / 3.6,
+        obstacle_specs: Sequence[StaticObstacleSpec] | None = None,
     ):
         self.horizon = float(horizon)
         self.dt = float(dt)
@@ -210,7 +211,7 @@ class StaticNudgeScenario(Scenario):
             self.offset_curve(self.lane_width, ds=0.25),
             self.offset_curve(-self.lane_width, ds=0.25),
         )
-        self.obstacle_specs = self._default_obstacles()
+        self.obstacle_specs = tuple(obstacle_specs) if obstacle_specs is not None else self._default_obstacles()
 
     @property
     def name(self) -> str:
@@ -247,14 +248,22 @@ class StaticNudgeScenario(Scenario):
         )
 
     def actors_at(self, t: float) -> list[ActorPrediction]:
-        times = np.array([float(t)], dtype=float)
+        times = np.array([0.0], dtype=float)
         return [self._actor_prediction(spec, times, float(t)) for spec in self.obstacle_specs]
 
     def _actor_prediction(self, spec: StaticObstacleSpec, times: np.ndarray, start_time: float) -> ActorPrediction:
         x, y, yaw = self._pose_from_sl(spec.s, spec.l)
-        times = np.asarray(times, dtype=float) + float(start_time)
+        relative_times = np.asarray(times, dtype=float)
+        times = relative_times + float(start_time)
         half_length = 0.5 * float(spec.length)
         half_width = 0.5 * float(spec.width)
+        temporal_blocked_range = {
+            "t": relative_times,
+            "s_min": np.full(relative_times.shape, float(spec.s) - half_length, dtype=float),
+            "s_max": np.full(relative_times.shape, float(spec.s) + half_length, dtype=float),
+            "l_min": np.full(relative_times.shape, float(spec.l) - half_width, dtype=float),
+            "l_max": np.full(relative_times.shape, float(spec.l) + half_width, dtype=float),
+        }
         return ActorPrediction(
             actor_id=spec.actor_id,
             actor_type=spec.actor_type,
@@ -271,6 +280,7 @@ class StaticNudgeScenario(Scenario):
                 "blocked_s_max": float(spec.s) + half_length,
                 "blocked_l_min": float(spec.l) - half_width,
                 "blocked_l_max": float(spec.l) + half_width,
+                "temporal_blocked_range": temporal_blocked_range,
                 "static": True,
             },
         )

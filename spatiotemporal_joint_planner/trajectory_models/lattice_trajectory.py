@@ -139,7 +139,9 @@ class LatticeTrajectoryModel(TrajectoryModel):
             a1=float(self.config.terminal_lateral_accel),
             t=t,
         )
-        x, y = self._xy_from_sl_batch(problem, s, l)
+        x = None
+        y = None
+        # x, y = self._xy_from_sl_batch(problem, s, l)
         yaw = None
         kappa = None
         if x is not None and y is not None:

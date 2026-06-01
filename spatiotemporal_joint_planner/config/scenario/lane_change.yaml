@@ -1,0 +1,28 @@
+scenario:
+  type: lane_change
+  horizon: 5.0
+  dt: 0.1
+  lane_width: 3.6
+  current_lane_l: null
+  target_lane_l: 0.0
+  target_speed: 12.0
+  route_length: 260.0
+  road_side_margin: 1.0
+  actors:
+    - actor_id: slow_vehicle_current_lane
+      actor_type: vehicle
+      s: 52.0
+      l: current_lane
+      length: 5.2
+      width: 2.1
+      s_v: 0.0
+      l_v: 0.0
+    - actor_id: target_lane_lead_vehicle
+      actor_type: vehicle
+      s: 80.0
+      l: target_lane
+      length: 4.8
+      width: 2.0
+      s_v: 0.0
+      l_v: 0.0
+

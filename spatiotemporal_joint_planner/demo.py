@@ -6,7 +6,8 @@ import os
 import shutil
 import subprocess
 import time
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -14,13 +15,24 @@ from spatiotemporal_joint_planner.common import ActorPrediction, EgoState, Plann
 from spatiotemporal_joint_planner.cost import ParametricTrajectoryCost, ParametricTrajectoryCostConfig
 from spatiotemporal_joint_planner.optimizer import CMAESConfig, CMAESOptimizer
 from spatiotemporal_joint_planner.planner import ParametricPlanner, ParametricPlannerConfig
-from spatiotemporal_joint_planner.scenario import LaneChangeScenario, StaticNudgeScenario
+from spatiotemporal_joint_planner.scenario import (
+    InteractiveLaneChangeScenario,
+    LaneChangeActorSpec,
+    LaneChangeScenario,
+    StaticNudgeScenario,
+    StaticObstacleSpec,
+)
 from spatiotemporal_joint_planner.trajectory_models import (
     BezierTrajectoryModel,
     LatticeTrajectoryConfig,
     LatticeTrajectoryModel,
     SvgdParticleTrajectoryModel,
 )
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parent
+DEMO_CONFIG_DIR = PACKAGE_ROOT / "config" / "demo"
+SCENARIO_CONFIG_DIR = PACKAGE_ROOT / "config" / "scenario"
 
 
 def _prepare_mp4_frame_dir(mp4_path: str) -> tuple[str, str]:
@@ -92,88 +104,364 @@ def _encode_mp4_from_frames(frame_dir: str, output_path: str, fps: float) -> boo
     return True
 
 
+def _load_yaml_mapping(path: Path) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required for YAML config files. Install dependency `pyyaml`.") from exc
+
+    with path.open("r", encoding="utf-8") as stream:
+        data = yaml.safe_load(stream) or {}
+    if not isinstance(data, Mapping):
+        raise ValueError(f"YAML config must be a mapping: {path}")
+    return dict(data)
+
+
+def _scenario_config_path(args) -> Path:
+    if args.scenario_config:
+        return Path(args.scenario_config).expanduser().resolve()
+    return SCENARIO_CONFIG_DIR / f"{args.scenario}.yaml"
+
+
+def _demo_config_path(args) -> Path:
+    if args.config:
+        return Path(args.config).expanduser().resolve()
+    return DEMO_CONFIG_DIR / "default.yaml"
+
+
+def _load_demo_config(args) -> dict[str, Any]:
+    path = _demo_config_path(args)
+    if not path.exists():
+        raise FileNotFoundError(f"Demo config not found: {path}")
+    raw = _load_yaml_mapping(path)
+    config = raw.get("demo", raw)
+    if not isinstance(config, Mapping):
+        raise ValueError(f"`demo` entry must be a mapping: {path}")
+    config = dict(config)
+    for override in args.set or []:
+        _apply_config_override(config, override)
+    args.config_path = str(path)
+    return config
+
+
+def _load_scenario_config(args) -> dict[str, Any]:
+    path = _scenario_config_path(args)
+    if not path.exists():
+        raise FileNotFoundError(f"Scenario config not found: {path}")
+
+    raw = _load_yaml_mapping(path)
+    config = raw.get("scenario", raw)
+    if not isinstance(config, Mapping):
+        raise ValueError(f"`scenario` entry must be a mapping: {path}")
+    config = dict(config)
+    config_type = config.get("type")
+    if config_type is not None and str(config_type) != str(args.scenario):
+        raise ValueError(f"Scenario config type `{config_type}` does not match CLI scenario `{args.scenario}`: {path}")
+
+    for override in args.scenario_set or []:
+        _apply_config_override(config, override)
+    args.scenario_config_path = str(path)
+    return config
+
+
+def _apply_config_override(config: dict[str, Any], override: str) -> None:
+    if "=" not in str(override):
+        raise ValueError(f"Config override must be key=value, got: {override}")
+    key, raw_value = str(override).split("=", 1)
+    keys = [part for part in key.strip().split(".") if part]
+    if not keys:
+        raise ValueError(f"Config override has empty key: {override}")
+
+    try:
+        import yaml
+
+        value = yaml.safe_load(raw_value)
+    except Exception:
+        value = raw_value
+
+    cursor = config
+    for part in keys[:-1]:
+        next_value = cursor.get(part)
+        if not isinstance(next_value, dict):
+            next_value = {}
+            cursor[part] = next_value
+        cursor = next_value
+    cursor[keys[-1]] = value
+
+
+def _scenario_value(args, config: Mapping[str, Any], legacy_name: str, config_name: str, default: Any) -> Any:
+    cli_value = getattr(args, legacy_name, None)
+    if cli_value is not None:
+        return cli_value
+    return config.get(config_name, default)
+
+
+def _config_section(args, section_name: str) -> Mapping[str, Any]:
+    config = getattr(args, "demo_config_values", {})
+    section = config.get(section_name, {}) if isinstance(config, Mapping) else {}
+    return section if isinstance(section, Mapping) else {}
+
+
+def _config_value(args, section_name: str, legacy_name: str, config_name: str, default: Any) -> Any:
+    cli_value = getattr(args, legacy_name, None)
+    if cli_value is not None:
+        return cli_value
+    return _config_section(args, section_name).get(config_name, default)
+
+
+def _resolve_demo_runtime_args(args) -> None:
+    args.max_steps = _config_value(args, "runtime", "max_steps", "max_steps", 150)
+    args.log_every = _config_value(args, "runtime", "log_every", "log_every", 5)
+    args.planning_dt = _config_value(args, "runtime", "planning_dt", "planning_dt", 0.25)
+    args.save_frame = _config_value(args, "visualization", "save_frame", "save_frame", None)
+    args.save_mp4 = _config_value(args, "visualization", "save_mp4", "save_mp4", None)
+    args.mp4_fps = _config_value(args, "visualization", "mp4_fps", "mp4_fps", 10.0)
+    args.pause = _config_value(args, "visualization", "pause", "pause", 0.08)
+
+    show = _config_value(args, "visualization", "show", "show", False)
+    if args.no_show is not None:
+        show = not args.no_show
+    args.show = bool(show)
+
+
+def _resolve_lane_l(value: Any, current_lane_l: float, target_lane_l: float) -> float:
+    if isinstance(value, str):
+        if value == "current_lane":
+            return float(current_lane_l)
+        if value == "target_lane":
+            return float(target_lane_l)
+    return float(value)
+
+
+def _static_obstacles_from_config(config: Mapping[str, Any]) -> Optional[tuple[StaticObstacleSpec, ...]]:
+    obstacles = config.get("obstacles")
+    if obstacles is None:
+        return None
+    specs = []
+    for item in obstacles:
+        specs.append(
+            StaticObstacleSpec(
+                actor_id=str(item.get("actor_id", "obstacle")),
+                actor_type=str(item.get("actor_type", "vehicle")),
+                s=float(item["s"]),
+                l=float(item["l"]),
+                length=float(item["length"]),
+                width=float(item["width"]),
+            )
+        )
+    return tuple(specs)
+
+
+def _lane_change_actors_from_config(
+    config: Mapping[str, Any],
+    current_lane_l: float,
+    target_lane_l: float,
+) -> Optional[tuple[LaneChangeActorSpec, ...]]:
+    actors = config.get("actors")
+    if actors is None:
+        return None
+    specs = []
+    for item in actors:
+        specs.append(
+            LaneChangeActorSpec(
+                actor_id=str(item.get("actor_id", "actor")),
+                actor_type=str(item.get("actor_type", "vehicle")),
+                s=float(item["s"]),
+                l=_resolve_lane_l(item.get("l", target_lane_l), current_lane_l, target_lane_l),
+                length=float(item["length"]),
+                width=float(item["width"]),
+                s_v=float(item.get("s_v", item.get("v", 0.0))),
+                l_v=float(item.get("l_v", 0.0)),
+            )
+        )
+    return tuple(specs)
+
+
+def _actor_config_value(
+    config: Mapping[str, Any],
+    actor_name: str,
+    field: str,
+    default: Any,
+    aliases: Sequence[str] = (),
+) -> Any:
+    actors = config.get("actors", {})
+    actor = actors.get(actor_name, {}) if isinstance(actors, Mapping) else {}
+    for key in (field, *aliases):
+        if isinstance(actor, Mapping) and key in actor:
+            return actor[key]
+    return default
+
+
 def _build_scenario(args):
+    config = getattr(args, "scenario_config_values", {})
     if args.scenario == "static_nudge":
+        target_speed = _scenario_value(args, config, "target_speed", "target_speed", 30.0 / 3.6)
         return StaticNudgeScenario(
-            horizon=args.horizon,
-            dt=args.traj_dt,
-            road_width=args.road_width,
-            lane_width=args.lane_width,
-            default_start_l=args.start_l,
-            target_speed=args.target_speed,
+            horizon=_scenario_value(args, config, "horizon", "horizon", 5.0),
+            dt=_scenario_value(args, config, "traj_dt", "dt", 0.1),
+            road_width=_scenario_value(args, config, "road_width", "road_width", 8.0),
+            lane_width=_scenario_value(args, config, "lane_width", "lane_width", 3.6),
+            default_start_l=_scenario_value(args, config, "start_l", "default_start_l", 2.0),
+            target_speed=target_speed,
+            obstacle_specs=_static_obstacles_from_config(config),
         )
     if args.scenario == "lane_change":
+        lane_width = float(_scenario_value(args, config, "lane_width", "lane_width", 3.6))
+        current_lane_l = _scenario_value(args, config, "lane_change_current_l", "current_lane_l", None)
+        current_lane_l = None if current_lane_l is None else float(current_lane_l)
+        target_lane_l = float(_scenario_value(args, config, "lane_change_target_l", "target_lane_l", 0.0))
+        resolved_current_lane_l = current_lane_l if current_lane_l is not None else -lane_width
         return LaneChangeScenario(
-            horizon=args.horizon,
-            dt=args.traj_dt,
-            lane_width=args.lane_width,
-            current_lane_l=args.lane_change_current_l,
-            target_lane_l=args.lane_change_target_l,
-            target_speed=args.target_speed,
-            route_length=args.lane_change_route_length,
-            road_side_margin=args.lane_change_side_margin,
+            horizon=_scenario_value(args, config, "horizon", "horizon", 5.0),
+            dt=_scenario_value(args, config, "traj_dt", "dt", 0.1),
+            lane_width=lane_width,
+            current_lane_l=current_lane_l,
+            target_lane_l=target_lane_l,
+            target_speed=_scenario_value(args, config, "target_speed", "target_speed", 12.0),
+            route_length=_scenario_value(args, config, "lane_change_route_length", "route_length", 260.0),
+            road_side_margin=_scenario_value(args, config, "lane_change_side_margin", "road_side_margin", 1.0),
+            actor_specs=_lane_change_actors_from_config(config, resolved_current_lane_l, target_lane_l),
+        )
+    if args.scenario == "interactive_lane_change":
+        lane_width = float(_scenario_value(args, config, "lane_width", "lane_width", 3.6))
+        current_lane_l = _scenario_value(args, config, "lane_change_current_l", "current_lane_l", None)
+        current_lane_l = None if current_lane_l is None else float(current_lane_l)
+        target_lane_l = float(_scenario_value(args, config, "lane_change_target_l", "target_lane_l", 0.0))
+        route_length = float(_scenario_value(args, config, "lane_change_route_length", "route_length", 520.0))
+        return InteractiveLaneChangeScenario(
+            horizon=_scenario_value(args, config, "horizon", "horizon", 5.0),
+            dt=_scenario_value(args, config, "traj_dt", "dt", 0.1),
+            lane_width=lane_width,
+            current_lane_l=current_lane_l,
+            target_lane_l=target_lane_l,
+            ego_speed=_scenario_value(args, config, "interactive_ego_speed", "ego_speed", 9.0),
+            target_speed=_scenario_value(args, config, "target_speed", "target_speed", 30.0 / 3.6),
+            route_length=max(route_length, 520.0),
+            road_side_margin=_scenario_value(args, config, "lane_change_side_margin", "road_side_margin", 1.0),
+            interaction_mode=_scenario_value(args, config, "interaction_mode", "interaction_mode", "keep"),
+            target_lead_s=_scenario_value(
+                args, config, "target_lead_s", "target_lead_s", _actor_config_value(config, "target_lead", "s", 45.0)
+            ),
+            target_lead_v=_scenario_value(
+                args,
+                config,
+                "target_lead_v",
+                "target_lead_v",
+                _actor_config_value(config, "target_lead", "s_v", 8.5, aliases=("v",)),
+            ),
+            target_rear_s=_scenario_value(
+                args, config, "target_rear_s", "target_rear_s", _actor_config_value(config, "target_rear", "s", -18.0)
+            ),
+            target_rear_v=_scenario_value(
+                args,
+                config,
+                "target_rear_v",
+                "target_rear_v",
+                _actor_config_value(config, "target_rear", "s_v", 15.0, aliases=("v",)),
+            ),
+            current_slow_s=_scenario_value(
+                args,
+                config,
+                "current_slow_s",
+                "current_slow_s",
+                _actor_config_value(config, "current_slow", "s", 24.0),
+            ),
+            current_slow_v=_scenario_value(
+                args,
+                config,
+                "current_slow_v",
+                "current_slow_v",
+                _actor_config_value(config, "current_slow", "s_v", 4.5, aliases=("v",)),
+            ),
         )
     raise ValueError(f"Unsupported scenario: {args.scenario}")
 
 
 def _build_trajectory_model(args):
-    if args.trajectory_model == "lattice_trajectory":
+    trajectory_model = _config_value(args, "trajectory_model", "trajectory_model", "type", "lattice_trajectory")
+    if trajectory_model == "lattice_trajectory":
         return LatticeTrajectoryModel(
             LatticeTrajectoryConfig(
-                min_terminal_speed=args.min_terminal_speed,
-                max_terminal_speed=args.max_terminal_speed,
+                min_terminal_speed=_config_value(
+                    args, "trajectory_model", "min_terminal_speed", "min_terminal_speed", 0.5
+                ),
+                max_terminal_speed=_config_value(
+                    args, "trajectory_model", "max_terminal_speed", "max_terminal_speed", 15.0
+                ),
             )
         )
-    if args.trajectory_model == "svgd_particle_trajectory":
+    if trajectory_model == "svgd_particle_trajectory":
         return SvgdParticleTrajectoryModel(
             LatticeTrajectoryConfig(
-                min_terminal_speed=args.min_terminal_speed,
-                max_terminal_speed=args.max_terminal_speed,
+                min_terminal_speed=_config_value(
+                    args, "trajectory_model", "min_terminal_speed", "min_terminal_speed", 0.5
+                ),
+                max_terminal_speed=_config_value(
+                    args, "trajectory_model", "max_terminal_speed", "max_terminal_speed", 15.0
+                ),
             )
         )
-    if args.trajectory_model == "bezier_trajectory":
+    if trajectory_model == "bezier_trajectory":
         return BezierTrajectoryModel()
-    raise ValueError(f"Unsupported trajectory model: {args.trajectory_model}")
+    raise ValueError(f"Unsupported trajectory model: {trajectory_model}")
 
 
 def _build_planner(args, trajectory_model) -> ParametricPlanner:
+    early_stop = _config_section(args, "optimizer").get("early_stop", True)
+
+    trajectory_certificate_enabled = _config_section(args, "cost").get("trajectory_certificate_enabled", True)
+    if args.scenario == "interactive_lane_change":
+        trajectory_certificate_enabled = False
+
+    warm_start = _config_section(args, "planner").get("warm_start", True)
+
     optimizer = CMAESOptimizer(
         CMAESConfig(
-            n_components=args.components,
-            n_samples=args.samples,
-            n_iterations=args.iters,
-            elite_fraction=args.elite,
-            init_std=args.init_std,
-            seed=args.seed,
-            early_stop=not args.disable_early_stop,
-            min_iterations=args.min_iters,
-            convergence_window=args.convergence_window,
-            cost_window_tol=args.cost_window_tol,
-            theta_window_tol=args.theta_window_tol,
-            component_sigma_tol=args.component_sigma_tol,
-            component_weight_tol=args.component_weight_tol,
+            n_components=_config_value(args, "optimizer", "components", "components", 2),
+            n_samples=_config_value(args, "optimizer", "samples", "samples", 48),
+            n_iterations=_config_value(args, "optimizer", "iters", "iterations", 50),
+            elite_fraction=_config_value(args, "optimizer", "elite", "elite_fraction", 0.25),
+            init_std=_config_value(args, "optimizer", "init_std", "init_std", 0.22),
+            seed=_config_value(args, "optimizer", "seed", "seed", 0),
+            early_stop=bool(early_stop),
+            min_iterations=_config_value(args, "optimizer", "min_iters", "min_iterations", 3),
+            convergence_window=_config_value(args, "optimizer", "convergence_window", "convergence_window", 5),
+            cost_window_tol=_config_value(args, "optimizer", "cost_window_tol", "cost_window_tol", 1e-3),
+            theta_window_tol=_config_value(args, "optimizer", "theta_window_tol", "theta_window_tol", 2e-2),
+            component_sigma_tol=_config_value(args, "optimizer", "component_sigma_tol", "component_sigma_tol", 0.08),
+            component_weight_tol=_config_value(args, "optimizer", "component_weight_tol", "component_weight_tol", 0.15),
         )
     )
     cost = ParametricTrajectoryCost(
         ParametricTrajectoryCostConfig(
-            road_edge_buffer=args.road_edge_buffer,
-            min_lateral_accel=args.min_lateral_accel,
-            max_lateral_accel=args.max_lateral_accel,
-            lateral_accel_zero_comfort=args.lateral_accel_zero_comfort,
-            min_kappa=args.min_kappa,
-            max_kappa=args.max_kappa,
-            kappa_zero_comfort=args.kappa_zero_comfort,
-            min_dkappa=args.min_dkappa,
-            max_dkappa=args.max_dkappa,
-            dkappa_zero_comfort=args.dkappa_zero_comfort,
-            min_lateral_jerk=args.min_lateral_jerk,
-            max_lateral_jerk=args.max_lateral_jerk,
-            lateral_jerk_zero_comfort=args.lateral_jerk_zero_comfort,
-            max_longitudinal_speed=args.max_speed,
-            speed_tracking_comfort=args.speed_tracking_comfort,
-            efficiency_progress_comfort=args.efficiency_progress_comfort,
-            reference_lateral_comfort=args.reference_lateral_comfort,
-            trajectory_certificate_enabled=not args.disable_trajectory_certificate,
+            road_edge_buffer=_config_value(args, "cost", "road_edge_buffer", "road_edge_buffer", 1.0),
+            min_lateral_accel=_config_value(args, "cost", "min_lateral_accel", "min_lateral_accel", -2.5),
+            max_lateral_accel=_config_value(args, "cost", "max_lateral_accel", "max_lateral_accel", 2.5),
+            lateral_accel_zero_comfort=_config_value(
+                args, "cost", "lateral_accel_zero_comfort", "lateral_accel_zero_comfort", 1.2
+            ),
+            min_kappa=_config_value(args, "cost", "min_kappa", "min_kappa", -0.20),
+            max_kappa=_config_value(args, "cost", "max_kappa", "max_kappa", 0.20),
+            kappa_zero_comfort=_config_value(args, "cost", "kappa_zero_comfort", "kappa_zero_comfort", 0.04),
+            min_dkappa=_config_value(args, "cost", "min_dkappa", "min_dkappa", -0.08),
+            max_dkappa=_config_value(args, "cost", "max_dkappa", "max_dkappa", 0.08),
+            dkappa_zero_comfort=_config_value(args, "cost", "dkappa_zero_comfort", "dkappa_zero_comfort", 0.04),
+            min_lateral_jerk=_config_value(args, "cost", "min_lateral_jerk", "min_lateral_jerk", -3.0),
+            max_lateral_jerk=_config_value(args, "cost", "max_lateral_jerk", "max_lateral_jerk", 3.0),
+            lateral_jerk_zero_comfort=_config_value(
+                args, "cost", "lateral_jerk_zero_comfort", "lateral_jerk_zero_comfort", 1.0
+            ),
+            max_longitudinal_speed=_config_value(args, "cost", "max_speed", "max_longitudinal_speed", 15.0),
+            speed_tracking_comfort=_config_value(
+                args, "cost", "speed_tracking_comfort", "speed_tracking_comfort", 2.5
+            ),
+            efficiency_progress_comfort=_config_value(
+                args, "cost", "efficiency_progress_comfort", "efficiency_progress_comfort", 8.0
+            ),
+            reference_lateral_comfort=_config_value(
+                args, "cost", "reference_lateral_comfort", "reference_lateral_comfort", 1.0
+            ),
+            trajectory_certificate_enabled=trajectory_certificate_enabled,
         )
     )
     return ParametricPlanner(
@@ -181,10 +469,10 @@ def _build_planner(args, trajectory_model) -> ParametricPlanner:
         cost_function=cost,
         optimizer=optimizer,
         config=ParametricPlannerConfig(
-            candidate_limit=args.mode_paths,
-            warm_start=not args.no_warm_start,
-            max_initial_anchors=args.max_initial_anchors,
-            objective_mode=args.objective_mode,
+            candidate_limit=_config_value(args, "planner", "mode_paths", "mode_paths", 8),
+            warm_start=bool(warm_start),
+            max_initial_anchors=_config_value(args, "planner", "max_initial_anchors", "max_initial_anchors", 96),
+            objective_mode=_config_value(args, "planner", "objective_mode", "objective_mode", "auto"),
         ),
     )
 
@@ -278,7 +566,10 @@ def _plot_frame(
 
     owns_figure = figure_axes is None
     if owns_figure:
-        fig, ax = plt.subplots(figsize=(10, 7))
+        if problem.metadata.get("scenario") == "interactive_lane_change":
+            fig, ax = plt.subplots(figsize=(14, 6))
+        else:
+            fig, ax = plt.subplots(figsize=(10, 7))
     else:
         fig, ax = figure_axes
         ax.clear()
@@ -352,15 +643,30 @@ def _plot_frame(
     )
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.55)
-    ax.legend(loc="upper right")
+    if problem.metadata.get("scenario") == "interactive_lane_change":
+        ax.legend(loc="lower right")
+    else:
+        ax.legend(loc="upper right")
     if tight:
-        if problem.metadata.get("scenario") == "lane_change":
+        if problem.metadata.get("scenario") == "interactive_lane_change":
+            ego_s = float(problem.ego.s)
+            route_end = float(getattr(scenario.ref_path, "s", [260.0])[-1])
+            left = max(-5.0, ego_s - 18.0)
+            right = min(route_end + 10.0, ego_s + 92.0)
+            if right - left < 90.0:
+                right = min(route_end + 10.0, left + 90.0)
+            ax.set_xlim(left, right)
+            ax.set_ylim(-10, 10)
+        elif problem.metadata.get("scenario") == "lane_change":
             ax.set_xlim(-5, 145)
             ax.set_ylim(-10, 10)
         else:
             ax.set_xlim(-8, 108)
             ax.set_ylim(-4, 88)
-        fig.tight_layout()
+        if problem.metadata.get("scenario") == "interactive_lane_change":
+            fig.tight_layout(rect=(0.0, 0.0, 0.86, 1.0))
+        else:
+            fig.tight_layout()
 
     if save_frame:
         os.makedirs(os.path.dirname(os.path.abspath(save_frame)), exist_ok=True)
@@ -407,15 +713,39 @@ def _plot_actors(ax, actors: Sequence[ActorPrediction]) -> None:
     for actor in actors:
         if np.asarray(actor.x).size == 0 or np.asarray(actor.y).size == 0:
             continue
-        x = float(np.asarray(actor.x, dtype=float)[0])
-        y = float(np.asarray(actor.y, dtype=float)[0])
-        yaw = float(np.asarray(actor.yaw, dtype=float)[0]) if np.asarray(actor.yaw).size else 0.0
+        x_values = np.asarray(actor.x, dtype=float)
+        y_values = np.asarray(actor.y, dtype=float)
+        yaw_values = np.asarray(actor.yaw, dtype=float)
+        x = float(x_values[0])
+        y = float(y_values[0])
+        yaw = float(yaw_values[0]) if yaw_values.size else 0.0
         if actor.actor_type == "pedestrian":
             face = "#D95F02"
             edge = "#7F2704"
         else:
             face = "#4C566A"
             edge = "#1F2937"
+        metadata = dict(actor.metadata or {})
+        if not bool(metadata.get("static", False)) and x_values.size > 1 and y_values.size > 1:
+            times = np.asarray(actor.times, dtype=float)
+            if times.size >= 2:
+                dt = float(np.median(np.diff(times)))
+                stride = max(1, int(round(0.5 / max(abs(dt), 1e-3))))
+            else:
+                stride = max(1, x_values.size // 10)
+            for idx in range(stride, min(x_values.size, y_values.size), stride):
+                future_yaw = float(yaw_values[idx]) if yaw_values.size > idx else yaw
+                ax.add_patch(
+                    Polygon(
+                        _box_corners(float(x_values[idx]), float(y_values[idx]), future_yaw, actor.length, actor.width),
+                        closed=True,
+                        facecolor=face,
+                        edgecolor=edge,
+                        linewidth=0.6,
+                        alpha=0.12,
+                        zorder=4,
+                    )
+                )
         ax.add_patch(
             Polygon(
                 _box_corners(x, y, yaw, actor.length, actor.width),
@@ -519,7 +849,7 @@ def main_simulation(args) -> str:
                 exec_idx,
                 save_frame=video_frame or args.save_frame,
                 show=args.show,
-                tight=video_frame is None,
+                tight=True,
                 pause_s=args.pause,
                 figure_axes=live_figure_axes,
             )
@@ -545,76 +875,51 @@ def main_simulation(args) -> str:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Spatiotemporal joint planner demo")
-    parser.add_argument("--scenario", choices=["static_nudge", "lane_change"], default="static_nudge")
+    parser.add_argument("--scenario", choices=["static_nudge", "lane_change", "interactive_lane_change"], default="static_nudge")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="YAML demo config path. Defaults to spatiotemporal_joint_planner/config/demo/default.yaml.",
+    )
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="Override a demo YAML value with dot path, e.g. --set optimizer.samples=32.",
+    )
+    parser.add_argument(
+        "--scenario-config",
+        type=str,
+        default=None,
+        help="YAML scenario config path. Defaults to spatiotemporal_joint_planner/config/scenario/<scenario>.yaml.",
+    )
+    parser.add_argument(
+        "--scenario-set",
+        action="append",
+        default=[],
+        help="Override a scenario YAML value with dot path, e.g. --scenario-set actors.current_slow.s=30.",
+    )
     parser.add_argument(
         "--trajectory-model",
         choices=["lattice_trajectory", "bezier_trajectory", "svgd_particle_trajectory"],
-        default="lattice_trajectory",
+        default=None,
+        help="Override trajectory_model.type from demo config.",
     )
-    parser.add_argument("--max-steps", type=int, default=150)
-    parser.add_argument("--log-every", type=int, default=5)
-    parser.add_argument("--planning-dt", type=float, default=0.25)
-    parser.add_argument("--horizon", type=float, default=5.0)
-    parser.add_argument("--traj-dt", type=float, default=0.1)
-    parser.add_argument("--road-width", type=float, default=8.0)
-    parser.add_argument("--lane-width", type=float, default=3.6)
-    parser.add_argument("--road-edge-buffer", type=float, default=1.0)
-    parser.add_argument("--start-l", type=float, default=2.0)
-    parser.add_argument("--lane-change-current-l", type=float, default=None)
-    parser.add_argument("--lane-change-target-l", type=float, default=0.0)
-    parser.add_argument("--lane-change-route-length", type=float, default=260.0)
-    parser.add_argument("--lane-change-side-margin", type=float, default=1.0)
-    parser.add_argument("--target-speed", type=float, default=30.0 / 3.6)
-    parser.add_argument("--min-terminal-speed", type=float, default=0.5)
-    parser.add_argument("--max-terminal-speed", type=float, default=15.0)
-    parser.add_argument("--max-speed", type=float, default=15.0)
-    parser.add_argument("--min-lateral-accel", type=float, default=-2.5)
-    parser.add_argument("--max-lateral-accel", type=float, default=2.5)
-    parser.add_argument("--lateral-accel-zero-comfort", type=float, default=1.2)
-    parser.add_argument("--min-kappa", type=float, default=-0.20)
-    parser.add_argument("--max-kappa", type=float, default=0.20)
-    parser.add_argument("--kappa-zero-comfort", type=float, default=0.04)
-    parser.add_argument("--min-dkappa", type=float, default=-0.08)
-    parser.add_argument("--max-dkappa", type=float, default=0.08)
-    parser.add_argument("--dkappa-zero-comfort", type=float, default=0.04)
-    parser.add_argument("--min-lateral-jerk", type=float, default=-3.0)
-    parser.add_argument("--max-lateral-jerk", type=float, default=3.0)
-    parser.add_argument("--lateral-jerk-zero-comfort", type=float, default=1.0)
-    parser.add_argument("--speed-tracking-comfort", type=float, default=2.5)
-    parser.add_argument("--efficiency-progress-comfort", type=float, default=8.0)
-    parser.add_argument("--reference-lateral-comfort", type=float, default=1.0)
-    parser.add_argument("--disable-trajectory-certificate", action="store_true")
-    parser.add_argument("--components", type=int, default=4)
-    parser.add_argument("--samples", type=int, default=64)
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--elite", type=float, default=0.25)
-    parser.add_argument("--init-std", type=float, default=0.22)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--disable-early-stop", action="store_true")
-    parser.add_argument("--min-iters", type=int, default=3)
-    parser.add_argument("--convergence-window", type=int, default=5)
-    parser.add_argument("--cost-window-tol", type=float, default=1e-3)
-    parser.add_argument("--theta-window-tol", type=float, default=2e-2)
-    parser.add_argument("--component-sigma-tol", type=float, default=0.08)
-    parser.add_argument("--component-weight-tol", type=float, default=0.15)
-    parser.add_argument("--max-initial-anchors", type=int, default=96)
-    parser.add_argument("--mode-paths", type=int, default=8)
-    parser.add_argument("--objective-mode", choices=["auto", "vectorized", "scalar"], default="auto")
-    parser.add_argument("--no-warm-start", action="store_true")
-    parser.add_argument("--save-frame", type=str, default=None)
-    parser.add_argument("--save-mp4", type=str, default=None)
-    parser.add_argument("--mp4-fps", type=float, default=10.0)
-    parser.add_argument("--pause", type=float, default=0.08)
-    parser.add_argument("--show", action="store_true")
-    parser.add_argument("--no-show", action="store_true")
+    parser.add_argument("--max-steps", type=int, default=None, help="Override runtime.max_steps from demo config.")
+    parser.add_argument("--save-frame", type=str, default=None, help="Save one frame to image path.")
+    parser.add_argument("--save-mp4", type=str, default=None, help="Save an MP4 rollout to this path.")
+    parser.add_argument("--show", action="store_true", default=None, help="Show live matplotlib visualization.")
+    parser.add_argument("--no-show", action="store_true", default=None, help="Disable visualization even if config enables it.")
     return parser
 
 
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
-    if args.no_show:
-        args.show = False
+    args.demo_config_values = _load_demo_config(args)
+    args.scenario_config_values = _load_scenario_config(args)
+    _resolve_demo_runtime_args(args)
     main_simulation(args)
 
 

@@ -10,9 +10,16 @@ requires-python = ">=3.9"
 dependencies = [
     "numpy",
     "matplotlib",
+    "pyyaml",
 ]
 
 [tool.setuptools.packages.find]
 include = [
     "spatiotemporal_joint_planner*",
+]
+
+[tool.setuptools.package-data]
+spatiotemporal_joint_planner = [
+    "config/demo/*.yaml",
+    "config/scenario/*.yaml",
 ]

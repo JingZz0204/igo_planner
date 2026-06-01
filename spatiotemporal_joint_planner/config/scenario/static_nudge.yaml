@@ -1,0 +1,9 @@
+scenario:
+  type: static_nudge
+  horizon: 5.0
+  dt: 0.1
+  road_width: 8.0
+  lane_width: 3.6
+  default_start_l: 2.0
+  target_speed: 8.333333333333334
+

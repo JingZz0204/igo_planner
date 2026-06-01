@@ -180,15 +180,15 @@ class ParametricTrajectoryCost(CostFunction):
         )
         soft_hierarchy_cost = float(
             1.0e3 * efficiency_score
-            + 1.0e2 * comfort_score
-            + 1.0e1 * reference_score
+            + 1.0e2 * reference_score
+            + 1.0e1 * comfort_score
         )
         if bool(self.config.trajectory_certificate_enabled):
             soft_hierarchy_cost = float(
                 1.0e3 * efficiency_score
                 + 1.0e2 * trajectory_certificate_score
+                + 1.0e2 * reference_score
                 + 1.0e1 * comfort_score
-                + 1.0e0 * reference_score
             )
 
         total = float(hard_hierarchy_cost + soft_hierarchy_cost)
@@ -351,15 +351,15 @@ class ParametricTrajectoryCost(CostFunction):
         )
         soft_hierarchy_cost = (
             1.0e3 * scores["efficiency_score"]
-            + 1.0e2 * scores["comfort_score"]
-            + 1.0e1 * scores["reference_score"]
+            + 1.0e2 * scores["reference_score"]
+            + 1.0e1 * scores["comfort_score"]
         )
         if bool(self.config.trajectory_certificate_enabled):
             soft_hierarchy_cost = (
                 1.0e3 * scores["efficiency_score"]
                 + 1.0e2 * certificate_score
+                + 1.0e2 * scores["reference_score"]
                 + 1.0e1 * scores["comfort_score"]
-                + 1.0e0 * scores["reference_score"]
             )
         total = np.asarray(hard_hierarchy_cost + soft_hierarchy_cost, dtype=float)
         total[~np.isfinite(total)] = float("inf")
@@ -385,7 +385,7 @@ class ParametricTrajectoryCost(CostFunction):
         lateral_jerk = self._batch_gradient(l_a, t)
 
         terms = {}
-        terms.update(self._lattice_batch_collision_terms(s, l, blocked_ranges))
+        terms.update(self._lattice_batch_collision_terms(s, l, t, blocked_ranges))
         terms.update(self._lattice_batch_road_terms(l, problem))
         terms.update(
             self._lattice_batch_bounded_zero_terms(
@@ -484,12 +484,19 @@ class ParametricTrajectoryCost(CostFunction):
             "speed_score": self._saturate_array(speed_limit_cost + speed_deviation_cost, self.config.speed_score_scale),
         }
 
-    def _lattice_batch_collision_terms(self, s: np.ndarray, l: np.ndarray, blocked_ranges: Sequence[dict]) -> dict:
+    def _lattice_batch_collision_terms(
+        self,
+        s: np.ndarray,
+        l: np.ndarray,
+        t: np.ndarray,
+        blocked_ranges: Sequence[dict],
+    ) -> dict:
         running = np.zeros_like(s, dtype=float)
         overlap = np.zeros_like(s, dtype=float)
         if not blocked_ranges:
             return {"collision_running": running, "collision_overlap": overlap}
 
+        t_grid = self._batch_time_grid(t, s.shape)
         ego_s_min = s - float(self.config.ego_rear)
         ego_s_max = s + float(self.config.ego_front)
         half_width = 0.5 * float(self.config.ego_width)
@@ -497,13 +504,17 @@ class ParametricTrajectoryCost(CostFunction):
         ego_l_max = l + half_width
         decay = 0.2 + 0.8 * np.exp(-np.maximum(s - s[:, :1], 0.0) / max(float(self.config.collision_decay_s), 1e-3))
         for blocked in blocked_ranges:
-            s_mask = (ego_s_min <= float(blocked["s_max"])) & (float(blocked["s_min"]) <= ego_s_max)
-            l_mask = (ego_l_min <= float(blocked["l_max"])) & (float(blocked["l_min"]) <= ego_l_max)
+            blocked_s_min = self._blocked_value_at_times(blocked, "s_min", t_grid)
+            blocked_s_max = self._blocked_value_at_times(blocked, "s_max", t_grid)
+            blocked_l_min = self._blocked_value_at_times(blocked, "l_min", t_grid)
+            blocked_l_max = self._blocked_value_at_times(blocked, "l_max", t_grid)
+            s_mask = (ego_s_min <= blocked_s_max) & (blocked_s_min <= ego_s_max)
+            l_mask = (ego_l_min <= blocked_l_max) & (blocked_l_min <= ego_l_max)
             mask = s_mask & l_mask
             if not np.any(mask):
                 continue
-            s_overlap = np.minimum(ego_s_max, float(blocked["s_max"])) - np.maximum(ego_s_min, float(blocked["s_min"]))
-            l_overlap = np.minimum(ego_l_max, float(blocked["l_max"])) - np.maximum(ego_l_min, float(blocked["l_min"]))
+            s_overlap = np.minimum(ego_s_max, blocked_s_max) - np.maximum(ego_s_min, blocked_s_min)
+            l_overlap = np.minimum(ego_l_max, blocked_l_max) - np.maximum(ego_l_min, blocked_l_min)
             penetration = np.maximum(np.minimum(s_overlap, l_overlap), 0.0)
             sample_cost = decay * (
                 1.0 + shaped_hinge(penetration, safe=0.0, soft=0.6, tail_gain=0.35, cap=3.0)
@@ -535,6 +546,46 @@ class ParametricTrajectoryCost(CostFunction):
             "road_running": np.asarray(violation_cost + edge_cost, dtype=float),
             "road_violation": np.asarray(excess > 1e-6, dtype=float),
         }
+
+    @staticmethod
+    def _batch_time_grid(t: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
+        time = np.asarray(t, dtype=float)
+        if time.shape == target_shape:
+            return time
+        if time.ndim == 1 and len(target_shape) == 2 and time.size == target_shape[1]:
+            return np.broadcast_to(time[None, :], target_shape)
+        if time.size == 1:
+            return np.full(target_shape, float(time.reshape(-1)[0]), dtype=float)
+        return np.broadcast_to(time.reshape(1, -1), target_shape)
+
+    @staticmethod
+    def _blocked_value_at_times(blocked: dict, key: str, times: np.ndarray) -> np.ndarray:
+        times = np.asarray(times, dtype=float)
+        temporal = blocked.get("temporal")
+        if not temporal:
+            return np.full(times.shape, float(blocked[key]), dtype=float)
+
+        source_t = np.asarray(temporal.get("t", []), dtype=float).reshape(-1)
+        source_v = np.asarray(temporal.get(key, []), dtype=float).reshape(-1)
+        if source_t.size == 0 or source_v.size == 0:
+            return np.full(times.shape, float(blocked[key]), dtype=float)
+        n = min(source_t.size, source_v.size)
+        source_t = source_t[:n]
+        source_v = source_v[:n]
+        order = np.argsort(source_t)
+        source_t = source_t[order]
+        source_v = source_v[order]
+        flat = np.interp(times.reshape(-1), source_t, source_v, left=source_v[0], right=source_v[-1])
+        return flat.reshape(times.shape)
+
+    @staticmethod
+    def _blocked_scalar_at_time(blocked: dict, key: str, time: float) -> float:
+        value = ParametricTrajectoryCost._blocked_value_at_times(
+            blocked,
+            key,
+            np.array([float(time)], dtype=float),
+        )
+        return float(value[0])
 
     def _lattice_batch_bounded_zero_terms(
         self,
@@ -1422,8 +1473,8 @@ class ParametricTrajectoryCost(CostFunction):
             + 1.0e5 * lateral_accel_hard_score
             + 1.0e4 * lateral_jerk_hard_score
             + 1.0e3 * efficiency_score
-            + 1.0e2 * comfort_score
-            + 1.0e1 * reference_score
+            + 1.0e2 * reference_score
+            + 1.0e1 * comfort_score
         )
         return {
             "collision_flag": float(np.max(collision_overlap) > 0.0) if collision_overlap.size else 0.0,
@@ -1477,18 +1528,26 @@ class ParametricTrajectoryCost(CostFunction):
         if n == 0 or not blocked_ranges:
             return {"collision_running": running, "collision_overlap": overlap}
 
+        t_values = np.asarray(trajectory.t, dtype=float)
+        if t_values.size < n:
+            t_values = np.linspace(0.0, float(n - 1), num=n, dtype=float)
         start_s = float(s_values[0])
         for idx, (s, l) in enumerate(zip(s_values[:n], l_values[:n])):
             ego_s_min, ego_s_max, ego_l_min, ego_l_max = self._ego_frenet_range(float(s), float(l))
+            sample_t = float(t_values[idx])
             decay = self._range_decay(float(s) - start_s)
             sample_cost = 0.0
             for blocked in blocked_ranges:
-                if ranges_overlap(ego_s_min, ego_s_max, blocked["s_min"], blocked["s_max"]) and ranges_overlap(
-                    ego_l_min, ego_l_max, blocked["l_min"], blocked["l_max"]
+                blocked_s_min = self._blocked_scalar_at_time(blocked, "s_min", sample_t)
+                blocked_s_max = self._blocked_scalar_at_time(blocked, "s_max", sample_t)
+                blocked_l_min = self._blocked_scalar_at_time(blocked, "l_min", sample_t)
+                blocked_l_max = self._blocked_scalar_at_time(blocked, "l_max", sample_t)
+                if ranges_overlap(ego_s_min, ego_s_max, blocked_s_min, blocked_s_max) and ranges_overlap(
+                    ego_l_min, ego_l_max, blocked_l_min, blocked_l_max
                 ):
                     overlap[idx] = 1.0
-                    s_overlap = min(ego_s_max, blocked["s_max"]) - max(ego_s_min, blocked["s_min"])
-                    l_overlap = min(ego_l_max, blocked["l_max"]) - max(ego_l_min, blocked["l_min"])
+                    s_overlap = min(ego_s_max, blocked_s_max) - max(ego_s_min, blocked_s_min)
+                    l_overlap = min(ego_l_max, blocked_l_max) - max(ego_l_min, blocked_l_min)
                     penetration = max(min(float(s_overlap), float(l_overlap)), 0.0)
                     sample_cost = max(
                         sample_cost,
@@ -1755,13 +1814,30 @@ class ParametricTrajectoryCost(CostFunction):
         inflated["s_max"] = float(blocked["s_max"]) + s_buffer
         inflated["l_min"] = float(blocked["l_min"]) - l_buffer
         inflated["l_max"] = float(blocked["l_max"]) + l_buffer
+        temporal = blocked.get("temporal")
+        if temporal:
+            inflated_temporal = dict(temporal)
+            inflated_temporal["s_min"] = np.asarray(temporal["s_min"], dtype=float) - s_buffer
+            inflated_temporal["s_max"] = np.asarray(temporal["s_max"], dtype=float) + s_buffer
+            inflated_temporal["l_min"] = np.asarray(temporal["l_min"], dtype=float) - l_buffer
+            inflated_temporal["l_max"] = np.asarray(temporal["l_max"], dtype=float) + l_buffer
+            inflated["temporal"] = inflated_temporal
         inflated["planning_s_buffer"] = s_buffer
         inflated["planning_l_buffer"] = l_buffer
         return inflated
 
-    @staticmethod
-    def _blocked_range_from_metadata(actor: ActorPrediction) -> Optional[dict]:
+    def _blocked_range_from_metadata(self, actor: ActorPrediction) -> Optional[dict]:
         metadata = dict(actor.metadata or {})
+        temporal = self._temporal_blocked_range_from_metadata(metadata)
+        if temporal is not None:
+            return {
+                "s_min": float(temporal["s_min"][0]),
+                "s_max": float(temporal["s_max"][0]),
+                "l_min": float(temporal["l_min"][0]),
+                "l_max": float(temporal["l_max"][0]),
+                "actor_id": actor.actor_id,
+                "temporal": temporal,
+            }
         keys = ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")
         if all(key in metadata for key in keys):
             return {
@@ -1782,6 +1858,52 @@ class ParametricTrajectoryCost(CostFunction):
                 "actor_id": actor.actor_id,
             }
         return None
+
+    @staticmethod
+    def _temporal_blocked_range_from_metadata(metadata: dict) -> Optional[dict]:
+        raw = metadata.get("temporal_blocked_range")
+        if raw is None:
+            raw = metadata.get("temporal_blocked_ranges")
+        if raw is None:
+            return None
+
+        if isinstance(raw, dict):
+            source = raw
+        else:
+            source = {}
+            try:
+                rows = list(raw)
+            except TypeError:
+                return None
+            if not rows:
+                return None
+            for key in ("t", "s_min", "s_max", "l_min", "l_max"):
+                values = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        values.append(row.get(key))
+                    else:
+                        values.append(getattr(row, key, None))
+                source[key] = values
+
+        required = ("t", "s_min", "s_max", "l_min", "l_max")
+        if not all(key in source for key in required):
+            return None
+
+        arrays = {key: np.asarray(source[key], dtype=float).reshape(-1) for key in required}
+        n = min(arr.size for arr in arrays.values())
+        if n <= 0:
+            return None
+        arrays = {key: arr[:n] for key, arr in arrays.items()}
+        finite = np.ones((n,), dtype=bool)
+        for arr in arrays.values():
+            finite &= np.isfinite(arr)
+        if not np.any(finite):
+            return None
+        arrays = {key: arr[finite] for key, arr in arrays.items()}
+        order = np.argsort(arrays["t"])
+        arrays = {key: arr[order] for key, arr in arrays.items()}
+        return arrays
 
     def _blocked_range_from_actor_pose(self, actor: ActorPrediction, problem: PlanningProblem) -> Optional[dict]:
         x_values = np.asarray(actor.x, dtype=float)

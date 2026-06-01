@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -18,6 +19,8 @@ class LaneChangeActorSpec:
     l: float
     length: float
     width: float
+    s_v: float = 0.0
+    l_v: float = 0.0
 
 
 class LaneChangeScenario(Scenario):
@@ -33,6 +36,7 @@ class LaneChangeScenario(Scenario):
         target_speed: float = 12.0,
         route_length: float = 260.0,
         road_side_margin: float = 1.0,
+        actor_specs: Sequence[LaneChangeActorSpec] | None = None,
     ):
         self.horizon = float(horizon)
         self.dt = float(dt)
@@ -71,7 +75,7 @@ class LaneChangeScenario(Scenario):
         self.lane_markings = (
             self.offset_curve(lane_separator_l, ds=0.25),
         )
-        self.actor_specs = self._default_actors()
+        self.actor_specs = tuple(actor_specs) if actor_specs is not None else self._default_actors()
 
     @property
     def name(self) -> str:
@@ -117,7 +121,7 @@ class LaneChangeScenario(Scenario):
         )
 
     def actors_at(self, t: float) -> list[ActorPrediction]:
-        times = np.array([float(t)], dtype=float)
+        times = np.array([0.0], dtype=float)
         return [self._actor_prediction(spec, times, float(t)) for spec in self.actor_specs]
 
     def offset_curve(self, offset: float, ds: float = 0.25) -> tuple[list[float], list[float]]:
@@ -135,27 +139,40 @@ class LaneChangeScenario(Scenario):
         return values[:, 0].tolist(), values[:, 1].tolist()
 
     def _actor_prediction(self, spec: LaneChangeActorSpec, times: np.ndarray, start_time: float) -> ActorPrediction:
-        x, y, yaw = self._pose_from_sl(spec.s, spec.l)
-        times = np.asarray(times, dtype=float) + float(start_time)
+        relative_times = np.asarray(times, dtype=float)
+        times = relative_times + float(start_time)
+        s_values = float(spec.s) + float(spec.s_v) * times
+        l_values = float(spec.l) + float(spec.l_v) * times
+        poses = np.asarray([self._pose_from_sl(float(s), float(l)) for s, l in zip(s_values, l_values)], dtype=float)
         half_length = 0.5 * float(spec.length)
         half_width = 0.5 * float(spec.width)
+        temporal_blocked_range = {
+            "t": relative_times,
+            "s_min": s_values - half_length,
+            "s_max": s_values + half_length,
+            "l_min": l_values - half_width,
+            "l_max": l_values + half_width,
+        }
         return ActorPrediction(
             actor_id=spec.actor_id,
             actor_type=spec.actor_type,
             times=times,
-            x=np.full(times.shape, x, dtype=float),
-            y=np.full(times.shape, y, dtype=float),
-            yaw=np.full(times.shape, yaw, dtype=float),
+            x=poses[:, 0],
+            y=poses[:, 1],
+            yaw=poses[:, 2],
             length=float(spec.length),
             width=float(spec.width),
             metadata={
-                "s": float(spec.s),
-                "l": float(spec.l),
-                "blocked_s_min": float(spec.s) - half_length,
-                "blocked_s_max": float(spec.s) + half_length,
-                "blocked_l_min": float(spec.l) - half_width,
-                "blocked_l_max": float(spec.l) + half_width,
-                "static": True,
+                "s": float(s_values[0]),
+                "l": float(l_values[0]),
+                "s_v": float(spec.s_v),
+                "l_v": float(spec.l_v),
+                "blocked_s_min": float(s_values[0]) - half_length,
+                "blocked_s_max": float(s_values[0]) + half_length,
+                "blocked_l_min": float(l_values[0]) - half_width,
+                "blocked_l_max": float(l_values[0]) + half_width,
+                "temporal_blocked_range": temporal_blocked_range,
+                "static": abs(float(spec.s_v)) < 1e-9 and abs(float(spec.l_v)) < 1e-9,
             },
         )
 

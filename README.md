@@ -59,7 +59,7 @@ common              负责共享数据结构
 
 ## 可视化效果
 
-以下 GIF 使用 `static_nudge`、`lane_change` 两个场景，以及 `lattice_trajectory`、`bezier_trajectory` 两种参数化模式生成，用于快速观察规划器在静态绕行和换道任务中的轨迹行为。
+以下 GIF 使用 `static_nudge`、`lane_change`、`interactive_lane_change` 场景，以及 `lattice_trajectory`、`bezier_trajectory` 两种参数化模式生成，用于快速观察规划器在静态绕行、换道和交互换道任务中的轨迹行为。
 
 | 场景 | 轨迹模型 | 可视化 |
 | --- | --- | --- |
@@ -67,6 +67,16 @@ common              负责共享数据结构
 | `lane_change` | `lattice_trajectory` | ![lane_change lattice](docs/assets/lane_change_lattice.gif) |
 | `static_nudge` | `bezier_trajectory` | ![static_nudge bezier](docs/assets/static_nudge_bezier.gif) |
 | `lane_change` | `bezier_trajectory` | ![lane_change bezier](docs/assets/lane_change_bezier.gif) |
+
+### 交互换道 Keep 模式对比
+
+以下三组均使用 `interactive_lane_change` 场景，并保持目标车道后车 `interaction_mode=keep`。这里只改变目标车道后车的初始位置和速度，用来观察不同后车压力下的换道规划行为。
+
+| 后车配置 | 可视化 |
+| --- | --- |
+| `s=-28 m`, `v=10 m/s` | <img src="docs/assets/interactive_lane_change_rear_far_slow.gif" width="860" alt="interactive lane change rear far slow"> |
+| `s=-18 m`, `v=15 m/s` | <img src="docs/assets/interactive_lane_change_rear_nominal.gif" width="860" alt="interactive lane change rear nominal"> |
+| `s=-8 m`, `v=18 m/s` | <img src="docs/assets/interactive_lane_change_rear_close_fast.gif" width="860" alt="interactive lane change rear close fast"> |
 
 ## 安装
 
@@ -81,6 +91,7 @@ pip install -r requirements.txt
 ```text
 numpy
 matplotlib
+pyyaml
 ```
 
 如果需要保存 MP4，系统需要有 `ffmpeg`，或者 Python 环境中安装 `imageio-ffmpeg`。
@@ -104,19 +115,19 @@ python -B -m spatiotemporal_joint_planner.demo --scenario static_nudge --traject
 ### Lane Change 场景
 
 ```bash
-python -B -m spatiotemporal_joint_planner.demo --scenario lane_change --trajectory-model lattice_trajectory --target-speed 12.0 --show
+python -B -m spatiotemporal_joint_planner.demo --scenario lane_change --trajectory-model lattice_trajectory --scenario-set target_speed=12.0 --show
 ```
 
 ### 无可视化 smoke test
 
 ```bash
-python -B -m spatiotemporal_joint_planner.demo --scenario static_nudge --trajectory-model lattice_trajectory --max-steps 3 --samples 24 --iters 3 --components 4 --no-show
+python -B -m spatiotemporal_joint_planner.demo --scenario static_nudge --trajectory-model lattice_trajectory --max-steps 3 --set optimizer.samples=24 --set optimizer.iterations=3 --set optimizer.components=4 --no-show
 ```
 
 ### 保存 MP4
 
 ```bash
-python -B -m spatiotemporal_joint_planner.demo --scenario lane_change --trajectory-model lattice_trajectory --max-steps 80 --save-mp4 demo_outputs/lane_change.mp4 --mp4-fps 10 --no-show
+python -B -m spatiotemporal_joint_planner.demo --scenario lane_change --trajectory-model lattice_trajectory --max-steps 80 --save-mp4 demo_outputs/lane_change.mp4 --set visualization.mp4_fps=10 --no-show
 ```
 
 ## 目录结构
@@ -129,6 +140,14 @@ spatiotemporal_joint_planner/
   common/
     types.py
     __init__.py
+
+  config/
+    demo/
+      default.yaml
+    scenario/
+      static_nudge.yaml
+      lane_change.yaml
+      interactive_lane_change.yaml
 
   cost/
     base.py
@@ -154,6 +173,7 @@ spatiotemporal_joint_planner/
     base.py
     static_nudge.py
     lane_change.py
+    interactive_lane_change.py
     __init__.py
 
   trajectory_models/
@@ -560,10 +580,10 @@ terminal_speed_score
 - `terminal_progress_score` 评价终点之后是否还能保持足够前向推进。
 - `terminal_speed_score` 评价终点速度是否过低。
 
-该模块可以通过命令行关闭：
+该模块可以通过 demo 配置关闭：
 
 ```bash
---disable-trajectory-certificate
+--set cost.trajectory_certificate_enabled=false
 ```
 
 ## Demo 可视化
@@ -574,27 +594,26 @@ terminal_speed_score
 spatiotemporal_joint_planner/demo.py
 ```
 
-常用参数：
+常用入口：
 
 ```text
---scenario                         static_nudge / lane_change
---trajectory-model                 lattice_trajectory / bezier_trajectory
---objective-mode                   auto / vectorized / scalar
---max-steps                        仿真步数
---planning-dt                      每帧执行时间
---horizon                          规划时域
---traj-dt                          轨迹采样间隔
---target-speed                     目标速度
---max-speed                        最大速度
---samples                          CMA-ES 每轮样本数
---iters                            CMA-ES 迭代次数
---components                       CMA-ES 混合 component 数
---max-initial-anchors              warm start 最大 anchors 数
---show                             开启动画
---no-show                          关闭动画
+--scenario                         static_nudge / lane_change / interactive_lane_change
+--config                           demo YAML 配置文件路径
+--set                              覆盖 demo YAML 配置，例如 optimizer.samples=32
+--scenario-config                  scenario YAML 配置文件路径
+--scenario-set                     覆盖 scenario YAML 配置，例如 actors.current_slow.s=30
+--trajectory-model                 lattice_trajectory / bezier_trajectory / svgd_particle_trajectory
+--max-steps                        覆盖 runtime.max_steps
+--show / --no-show                 开启或关闭动画
 --save-frame                       保存单帧图片
 --save-mp4                         保存 MP4
---disable-trajectory-certificate   关闭 trajectory-level certificate cost
+```
+
+调参项默认写在：
+
+```text
+spatiotemporal_joint_planner/config/demo/default.yaml
+spatiotemporal_joint_planner/config/scenario/<scenario>.yaml
 ```
 
 日志中包含：
