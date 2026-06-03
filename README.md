@@ -72,6 +72,10 @@ common              负责共享数据结构
 
 以下三组均使用 `interactive_lane_change` 场景，并保持目标车道后车 `interaction_mode=keep`。这里只改变目标车道后车的初始位置和速度，用来观察不同后车压力下的换道规划行为。
 
+当前 `config/scenario/interactive_lane_change.yaml` 配置下的慢速 GIF：
+
+<img src="docs/assets/interactive_lane_change_current_config.gif" width="860" alt="interactive lane change current config">
+
 | 后车配置 | 可视化 |
 | --- | --- |
 | `s=-28 m`, `v=10 m/s` | <img src="docs/assets/interactive_lane_change_rear_far_slow.gif" width="860" alt="interactive lane change rear far slow"> |
