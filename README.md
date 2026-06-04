@@ -5,9 +5,10 @@
 当前项目重点关注：
 
 - 固定时域的时空联合轨迹规划。
-- 参数化轨迹优化，当前主要使用 CMA-ES。
-- `lattice_trajectory` 与 `bezier_trajectory` 两类轨迹模型。
-- `static_nudge` 与 `lane_change` 场景。
+- 参数化轨迹优化，支持 CMA-ES 和 IGO-style game optimizer。
+- `lattice_trajectory`、`frenet_bezier_trajectory`、`frenet_bspline_trajectory`、`frenet_via_bspline_trajectory` 等轨迹模型。
+- `static_nudge`、`interactive_lane_change` 与 `dense_target_lane_change` 场景。
+- 双车博弈规划，用于联合生成自车和目标车辆轨迹，并进行近似 Nash/regret 收敛检查。
 - 分层 cost，包括碰撞、道路边界、动态约束、效率、参考线吸引和 trajectory-level certificate cost。
 - warm start 机制，用于提升采样优化的稳定性和收敛速度。
 
@@ -56,6 +57,295 @@ common              负责共享数据结构
 ```
 
 其中 `trajectory_certificate_score` 是轨迹级非马尔可夫 cost 的统一入口，目前已经实现 terminal value，后续可继续扩展 occupation-style feature 和 certificate slack。
+
+## 博弈规划模块
+
+项目中已经加入一个 IGO 风格的双车博弈规划器，用于在交互换道场景中联合生成自车和目标车辆的未来轨迹。它不是简单把目标车辆当作固定预测障碍物，而是将目标车辆也建模为一个可优化的 player，在同一个固定 horizon 内与自车共同生成轨迹。
+
+当前实现面向两车博弈：
+
+```text
+player 1: ego
+player 2: target_rear
+```
+
+默认博弈对象由配置指定：
+
+```yaml
+game:
+  target_actor_id: target_lane_rear_vehicle
+```
+
+在 `interactive_lane_change` 和 `dense_target_lane_change` 场景中，目标车道后车会作为博弈车辆参与优化，其他车辆仍作为外部障碍物处理。
+
+### Player 与轨迹模型
+
+博弈规划器入口是：
+
+```python
+GameParametricPlanner
+```
+
+它会为每个 player 构造各自的轨迹模型和 cost：
+
+```text
+ego:
+  trajectory_model = lattice / frenet_bezier / frenet_bspline / frenet_via_bspline
+  cost = ParametricTrajectoryCost
+
+target_rear:
+  trajectory_model = VehicleLongitudinalTrajectoryModel
+  cost = VehicleGameCost
+```
+
+自车可以使用项目内已有的参数化轨迹模型，例如：
+
+```text
+lattice_trajectory
+frenet_bezier_trajectory
+frenet_bspline_trajectory
+frenet_via_bspline_trajectory
+```
+
+目标车当前使用纵向参数化：
+
+```text
+theta_target = [s_end, v_end]
+```
+
+其中 `s_end` 是目标车未来 5 秒末端纵向位置，`v_end` 是目标车未来 5 秒末端速度。目标车横向位置保持在目标车道中心线，通过五次多项式从当前 `s, v, a` 连接到终端 `s_end, v_end, a_end`。因此目标车不是固定匀速预测，而是在给定约束范围内可以加速、减速或让行。
+
+### 联合轨迹生成流程
+
+`GameParametricPlanner` 会构造一个 `GameOptimizationProblem`，其中包含：
+
+```text
+players
+decode_joint(parameters_by_player)
+evaluate_joint(joint_trajectory)
+evaluate_joint_batch(parameters_by_player)
+```
+
+每一次采样都会形成一组联合参数：
+
+```text
+joint_theta = {
+  ego: ego_theta,
+  target_rear: target_theta
+}
+```
+
+然后通过 `decode_joint` 解码为联合轨迹：
+
+```text
+joint_trajectory = {
+  ego: ego_trajectory,
+  target_rear: target_trajectory
+}
+```
+
+在评估自车 cost 时，目标车不再是固定预测，而是由 `target_rear` player 的优化轨迹生成动态碰撞约束。这样自车轨迹会和目标车的博弈轨迹进行时间对齐的碰撞检测。
+
+### IGO Game Optimizer
+
+博弈优化器是：
+
+```python
+GameIGOOptimizer
+```
+
+它使用和 CMA-ES 类似的分布式采样更新方式，但不是只优化一个 agent 的 cost，而是为每个 player 维护自己的采样分布：
+
+```text
+ego distribution
+target_rear distribution
+```
+
+每轮迭代流程如下：
+
+1. 从每个 player 的分布中采样候选参数。
+2. 将各 player 参数配对，形成 joint samples。
+3. 批量 decode 成联合轨迹。
+4. 分别计算 ego cost 和 target cost。
+5. 根据各自 cost 更新各自的采样分布。
+6. 从历史 joint candidates 中选择当前最优联合解。
+7. 执行 feasibility、joint stability 和 Nash/regret 收敛检查。
+
+这套优化是 general-sum game。自车和目标车各自拥有自己的 cost，并不要求共享同一个全局目标函数。
+
+### 自车 Cost
+
+自车在博弈模式下仍然使用：
+
+```python
+ParametricTrajectoryCost
+```
+
+它包含碰撞、道路边界、曲率、曲率变化率、横向加速度、横向 jerk、效率、参考线吸引和舒适性等分层 cost。博弈模式下的关键差异是：目标车的轨迹由 target player 优化生成，并作为随时间变化的障碍物参与自车碰撞 cost。
+
+在 `interactive_lane_change` 和 `dense_target_lane_change` 场景下，当前会禁用 trajectory-level certificate cost，避免 terminal certificate 对交互换道行为产生额外干扰。
+
+### 目标车 Cost
+
+目标车使用：
+
+```python
+VehicleGameCost
+```
+
+它描述目标车自己的合理驾驶行为，当前层级结构为：
+
+```text
+1e9 * collision_score
++ 1e8 * road_score
++ 1e4 * headway_score
++ 1e3 * speed_score
++ 1e2 * prior_score
++ 1e2 * lane_keep_score
++ 1e1 * comfort_score
+```
+
+其中：
+
+- `collision_score`：目标车与其他障碍物或自车轨迹是否碰撞。
+- `road_score`：目标车是否超出道路边界。
+- `headway_score`：目标车是否与前车或自车保持合理车距。
+- `speed_score`：目标车是否接近期望速度。
+- `prior_score`：目标车是否过度偏离原始运动趋势。
+- `lane_keep_score`：目标车是否保持在目标车道。
+- `comfort_score`：目标车加速度和 jerk 是否平顺。
+
+这使得目标车不会为了配合自车而产生明显不合理行为，例如突然倒车、过度急刹或撞上前方车辆。
+
+### 联合解选择
+
+优化过程中会产生大量 joint candidates：
+
+```text
+(ego_theta_i, target_theta_i)
+```
+
+当前联合解选择策略是：
+
+```text
+ego prioritized + opponent rank gate
+```
+
+也就是说，规划器优先选择 ego cost 较低的候选，但要求 target 的 cost rank 不能太差。如果找不到满足 target rank gate 的候选，则退化为综合 rank 更好的联合解。
+
+对应配置：
+
+```yaml
+optimizer:
+  opponent_rank_gate: 0.35
+```
+
+这个设计避免联合解只服务自车，而完全牺牲目标车辆的合理性。
+
+### Nash / Regret 收敛检查
+
+博弈优化器加入了近似 Nash 检查，而不是只看 cost 是否下降。对当前选中的联合解，优化器会分别检查每个 player 在“对方策略固定”时，是否还能通过单边改变自己的策略显著降低 cost。
+
+近似形式为：
+
+```text
+ego_regret =
+  cost_ego(current_ego, current_target)
+  - min cost_ego(candidate_ego, current_target)
+
+target_regret =
+  cost_target(current_target, current_ego)
+  - min cost_target(candidate_target, current_ego)
+```
+
+如果某个 player 的 regret 很大，说明它仍然有明显动力单边偏离当前解，因此当前 joint solution 不像 Nash equilibrium。
+
+相关配置：
+
+```yaml
+optimizer:
+  nash_check: true
+  nash_regret_tol: 0.02
+  nash_candidate_limit: 20
+  nash_perturbation: 0.04
+```
+
+日志中会输出类似字段：
+
+```text
+feas=1 nash=0.003 ego_reg=0.003 target_reg=0.001 joint_shift=0.046
+```
+
+其中：
+
+- `feas` 表示当前联合解是否可行。
+- `nash` 表示当前最大近似 regret。
+- `ego_reg` 表示自车单边偏离 regret。
+- `target_reg` 表示目标车单边偏离 regret。
+- `joint_shift` 表示最近窗口内联合参数变化幅度。
+
+### 早停机制
+
+博弈模式下的早停综合考虑以下信号：
+
+```text
+player-level convergence
+joint-level convergence
+Nash/regret check
+selected joint feasibility
+```
+
+当前诊断包括：
+
+- 每个 player 的 best cost window 是否稳定。
+- 每个 player 的 best theta 是否稳定。
+- 每个 player 是否存在权重足够大且 sigma 足够小的 component。
+- 最近窗口内 joint theta 是否稳定。
+- 最近窗口内 joint cost 是否稳定。
+- 近似 Nash regret 是否低于阈值。
+- 当前 selected joint solution 是否 feasible。
+
+因此，博弈优化不是固定迭代次数退出，而是在满足最小迭代次数后，结合 player 收敛、joint 收敛和 Nash/regret 诊断提前停止。
+
+### 如何运行博弈规划
+
+可以通过配置启用：
+
+```yaml
+planner:
+  type: game
+```
+
+也可以在命令行中临时覆盖：
+
+```bash
+python -B -m spatiotemporal_joint_planner.demo \
+  --scenario dense_target_lane_change \
+  --trajectory-model lattice_trajectory \
+  --set planner.type=game \
+  --show
+```
+
+也可以使用 Frenet 参数化：
+
+```bash
+python -B -m spatiotemporal_joint_planner.demo \
+  --scenario dense_target_lane_change \
+  --trajectory-model frenet_bspline_trajectory \
+  --set planner.type=game \
+  --show
+```
+
+### 当前限制
+
+当前博弈模块仍然是原型实现，主要限制包括：
+
+- 当前只实现两车博弈：ego 与一个目标车辆。
+- 目标车当前只做纵向参数化，不做横向变道。
+- 目标车行为不是完整意图预测，而是在给定车道内优化 `[s_end, v_end]`。
+- Nash 检查是采样候选上的近似检查，不是解析 Nash 证明。
+- 当前没有显式 contingency planning，也没有多模态分叉轨迹。
+- 当前 joint candidate selection 仍然偏 ego-prioritized，后续可以扩展为更严格的 equilibrium selection 或 social welfare selection。
 
 ## 可视化效果
 
