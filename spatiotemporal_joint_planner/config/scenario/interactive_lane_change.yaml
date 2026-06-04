@@ -30,7 +30,7 @@ scenario:
     target_rear:
       actor_id: target_lane_rear_vehicle
       actor_type: vehicle
-      s: -12.0
+      s: -17.0
       l: target_lane
       length: 4.8
       width: 2.0

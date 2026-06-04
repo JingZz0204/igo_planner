@@ -7,6 +7,16 @@ trajectory_model:
   type: lattice_trajectory
   min_terminal_speed: 0.5
   max_terminal_speed: 15.0
+  degree: 2
+  num_control_points: 3
+  min_mid_time: 1.2
+  max_mid_time: 4.0
+  min_mid_s_offset: 12.0
+  min_mid_speed_floor: 3.0
+  min_mid_time_ratio: 0.25
+  max_mid_time_ratio: 0.85
+  terminal_time_buffer: 0.5
+  monotonic_lateral: false
 
 optimizer:
   components: 2
@@ -17,11 +27,19 @@ optimizer:
   seed: 0
   early_stop: true
   min_iterations: 3
-  convergence_window: 5
+  convergence_window: 3
   cost_window_tol: 0.001
   theta_window_tol: 0.02
   component_sigma_tol: 0.08
   component_weight_tol: 0.15
+  max_anchor_samples: 128
+  opponent_rank_gate: 0.35
+  nash_check: true
+  nash_regret_tol: 0.02
+  nash_candidate_limit: 20
+  nash_perturbation: 0.04
+  joint_theta_window_tol: 0.05
+  joint_cost_window_tol: 0.002
 
 cost:
   road_edge_buffer: 1.0
@@ -44,10 +62,18 @@ cost:
   trajectory_certificate_enabled: true
 
 planner:
+  type: parametric
   max_initial_anchors: 96
   mode_paths: 8
   objective_mode: auto
   warm_start: true
+
+game:
+  target_actor_id: target_lane_rear_vehicle
+  target_min_terminal_speed: 0.0
+  target_max_terminal_speed: 15.0
+  target_min_terminal_s_offset: -10.0
+  target_max_terminal_s_offset: 25.0
 
 visualization:
   save_frame: null
@@ -55,4 +81,3 @@ visualization:
   mp4_fps: 10.0
   pause: 0.08
   show: false
-

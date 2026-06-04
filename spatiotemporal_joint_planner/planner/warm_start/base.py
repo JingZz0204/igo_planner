@@ -91,6 +91,9 @@ class CompositeWarmStartGenerator(WarmStartGenerator):
 
 def default_parametric_warm_start_generator() -> WarmStartGenerator:
     from .bezier import BezierTrajectoryWarmStartGenerator
+    from .frenet_bezier import FrenetBezierWarmStartGenerator
+    from .frenet_bspline import FrenetBSplineWarmStartGenerator
+    from .frenet_via_bspline import FrenetViaBSplineWarmStartGenerator
     from .terminal_state import SvgdParticleWarmStartGenerator, TerminalStateWarmStartGenerator
 
     return CompositeWarmStartGenerator(
@@ -98,6 +101,9 @@ def default_parametric_warm_start_generator() -> WarmStartGenerator:
             SvgdParticleWarmStartGenerator(),
             TerminalStateWarmStartGenerator(),
             BezierTrajectoryWarmStartGenerator(),
+            FrenetBezierWarmStartGenerator(),
+            FrenetBSplineWarmStartGenerator(),
+            FrenetViaBSplineWarmStartGenerator(),
             DefaultWarmStartGenerator(),
         ]
     )

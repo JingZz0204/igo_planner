@@ -1,0 +1,61 @@
+scenario:
+  type: dense_target_lane_change
+  horizon: 5.0
+  dt: 0.1
+  lane_width: 3.6
+  current_lane_l: null
+  target_lane_l: 0.0
+  ego_speed: 9.0
+  target_speed: 12.0
+  route_length: 650.0
+  road_side_margin: 1.0
+  interaction_mode: keep
+  actors:
+    current_slow:
+      actor_id: current_lane_slow_vehicle
+      actor_type: vehicle
+      s: 34.0
+      l: current_lane
+      length: 5.0
+      width: 2.0
+      s_v: 4.5
+    target_back:
+      actor_id: target_lane_back_vehicle
+      actor_type: vehicle
+      s: -42.0
+      l: target_lane
+      length: 4.8
+      width: 2.0
+      s_v: 11.2
+    target_rear:
+      actor_id: target_lane_rear_vehicle
+      actor_type: vehicle
+      s: -12.0
+      l: target_lane
+      length: 4.8
+      width: 2.0
+      s_v: 11.8
+    target_gap_front:
+      actor_id: target_lane_gap_front_vehicle
+      actor_type: vehicle
+      s: 6.0
+      l: target_lane
+      length: 4.8
+      width: 2.0
+      s_v: 10.8
+    target_mid:
+      actor_id: target_lane_mid_vehicle
+      actor_type: vehicle
+      s: 25.0
+      l: target_lane
+      length: 4.8
+      width: 2.0
+      s_v: 10.6
+    target_lead:
+      actor_id: target_lane_lead_vehicle
+      actor_type: vehicle
+      s: 49.0
+      l: target_lane
+      length: 4.8
+      width: 2.0
+      s_v: 11.0

@@ -59,28 +59,13 @@ common              负责共享数据结构
 
 ## 可视化效果
 
-以下 GIF 使用 `static_nudge`、`lane_change`、`interactive_lane_change` 场景，以及 `lattice_trajectory`、`bezier_trajectory` 两种参数化模式生成，用于快速观察规划器在静态绕行、换道和交互换道任务中的轨迹行为。
+以下 GIF 使用 `static_nudge`、`interactive_lane_change`、`dense_target_lane_change` 三个场景，以及 `lattice_trajectory`、`frenet_bezier_trajectory`、`frenet_bspline_trajectory` 三种参数化模式生成。GIF 按较慢速度播放，便于观察轨迹形状、绕行和换道过程。
 
-| 场景 | 轨迹模型 | 可视化 |
-| --- | --- | --- |
-| `static_nudge` | `lattice_trajectory` | ![static_nudge lattice](docs/assets/static_nudge_lattice.gif) |
-| `lane_change` | `lattice_trajectory` | ![lane_change lattice](docs/assets/lane_change_lattice.gif) |
-| `static_nudge` | `bezier_trajectory` | ![static_nudge bezier](docs/assets/static_nudge_bezier.gif) |
-| `lane_change` | `bezier_trajectory` | ![lane_change bezier](docs/assets/lane_change_bezier.gif) |
-
-### 交互换道 Keep 模式对比
-
-以下三组均使用 `interactive_lane_change` 场景，并保持目标车道后车 `interaction_mode=keep`。这里只改变目标车道后车的初始位置和速度，用来观察不同后车压力下的换道规划行为。
-
-当前 `config/scenario/interactive_lane_change.yaml` 配置下的慢速 GIF：
-
-<img src="docs/assets/interactive_lane_change_current_config.gif" width="860" alt="interactive lane change current config">
-
-| 后车配置 | 可视化 |
-| --- | --- |
-| `s=-28 m`, `v=10 m/s` | <img src="docs/assets/interactive_lane_change_rear_far_slow.gif" width="860" alt="interactive lane change rear far slow"> |
-| `s=-18 m`, `v=15 m/s` | <img src="docs/assets/interactive_lane_change_rear_nominal.gif" width="860" alt="interactive lane change rear nominal"> |
-| `s=-8 m`, `v=18 m/s` | <img src="docs/assets/interactive_lane_change_rear_close_fast.gif" width="860" alt="interactive lane change rear close fast"> |
+| 场景 | `lattice_trajectory` | `frenet_bezier_trajectory` | `frenet_bspline_trajectory` |
+| --- | --- | --- | --- |
+| `static_nudge` | <img src="docs/assets/static_nudge_lattice.gif" width="320" alt="static_nudge lattice"> | <img src="docs/assets/static_nudge_frenet_bezier.gif" width="320" alt="static_nudge frenet bezier"> | <img src="docs/assets/static_nudge_frenet_bspline.gif" width="320" alt="static_nudge frenet bspline"> |
+| `interactive_lane_change` | <img src="docs/assets/interactive_lane_change_lattice.gif" width="320" alt="interactive_lane_change lattice"> | <img src="docs/assets/interactive_lane_change_frenet_bezier.gif" width="320" alt="interactive_lane_change frenet bezier"> | <img src="docs/assets/interactive_lane_change_frenet_bspline.gif" width="320" alt="interactive_lane_change frenet bspline"> |
+| `dense_target_lane_change` | <img src="docs/assets/dense_target_lane_change_lattice.gif" width="320" alt="dense_target_lane_change lattice"> | <img src="docs/assets/dense_target_lane_change_frenet_bezier.gif" width="320" alt="dense_target_lane_change frenet bezier"> | <img src="docs/assets/dense_target_lane_change_frenet_bspline.gif" width="320" alt="dense_target_lane_change frenet bspline"> |
 
 ## 安装
 
