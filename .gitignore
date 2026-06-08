@@ -17,5 +17,7 @@ SIMPL-main/
 !docs/
 !docs/assets/
 !docs/assets/*.gif
+!docs/assets/black_box_tutorial/
+!docs/assets/black_box_tutorial/*.png
 *.html
 .DS_Store
