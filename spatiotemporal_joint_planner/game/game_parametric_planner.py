@@ -211,8 +211,10 @@ class GameParametricPlanner(Planner):
         ego_batch: dict,
         target_batch: dict,
         problem: PlanningProblem,
+        target_cost_function: Optional[VehicleGameCost] = None,
     ) -> np.ndarray:
         cost = self.ego_cost_function
+        target_cost = target_cost_function or self.target_cost_function
         required = ("_blocked_ranges", "_lattice_batch_running_terms", "_lattice_batch_hierarchy_scores")
         if not all(hasattr(cost, name) for name in required):
             raise ValueError("Ego cost function does not expose lattice batch helpers.")
@@ -227,9 +229,9 @@ class GameParametricPlanner(Planner):
             agent_front=float(cost.config.ego_front),
             agent_rear=float(cost.config.ego_rear),
             agent_width=float(cost.config.ego_width),
-            other_front=float(self.target_cost_function.config.vehicle_front) + float(cost.config.planning_obstacle_s_buffer),
-            other_rear=float(self.target_cost_function.config.vehicle_rear) + float(cost.config.planning_obstacle_s_buffer),
-            other_width=float(self.target_cost_function.config.vehicle_width)
+            other_front=float(target_cost.config.vehicle_front) + float(cost.config.planning_obstacle_s_buffer),
+            other_rear=float(target_cost.config.vehicle_rear) + float(cost.config.planning_obstacle_s_buffer),
+            other_width=float(target_cost.config.vehicle_width)
             + 2.0 * float(cost.config.planning_obstacle_l_buffer),
             decay_s=float(cost.config.collision_decay_s),
         )
@@ -273,12 +275,14 @@ class GameParametricPlanner(Planner):
         target_batch: dict,
         ego_batch: dict,
         problem: PlanningProblem,
+        target_cost_function: Optional[VehicleGameCost] = None,
     ) -> np.ndarray:
-        cfg = self.target_cost_function.config
+        target_cost = target_cost_function or self.target_cost_function
+        cfg = target_cost.config
         s = np.asarray(target_batch["s"], dtype=float)
         l = np.asarray(target_batch["l"], dtype=float)
         t = np.asarray(target_batch["t"], dtype=float)
-        blocked_ranges = self.target_cost_function._blocked_ranges(problem, opponents=())
+        blocked_ranges = target_cost._blocked_ranges(problem, opponents=())
         exo_collision = self._agent_blocked_collision_batch(
             s=s,
             l=l,
@@ -306,20 +310,34 @@ class GameParametricPlanner(Planner):
         )
         collision_running = np.maximum(exo_collision["collision_running"], ego_collision["collision_running"])
         collision_overlap = np.maximum(exo_collision["collision_overlap"], ego_collision["collision_overlap"])
-        road_running, _road_violation = self._target_road_terms_batch(l, problem)
-        speed_running, _speed_violation = self._target_speed_terms_batch(np.asarray(target_batch["s_v"], dtype=float), problem)
+        road_running, _road_violation = self._target_road_terms_batch(
+            l,
+            problem,
+            target_cost_function=target_cost,
+        )
+        speed_running, _speed_violation = self._target_speed_terms_batch(
+            np.asarray(target_batch["s_v"], dtype=float),
+            problem,
+            target_cost_function=target_cost,
+        )
         comfort_running = self._target_comfort_terms_batch(
             np.asarray(target_batch["s_a"], dtype=float),
             t,
+            target_cost_function=target_cost,
         )
-        lane_running = self._target_lane_terms_batch(l, problem)
-        prior_running = self._target_prior_terms_batch(np.asarray(target_batch["s_v"], dtype=float), problem)
+        lane_running = self._target_lane_terms_batch(l, problem, target_cost_function=target_cost)
+        prior_running = self._target_prior_terms_batch(
+            np.asarray(target_batch["s_v"], dtype=float),
+            problem,
+            target_cost_function=target_cost,
+        )
         headway_running = self._target_headway_terms_batch(
             target_s=s,
             target_l=l,
             target_s_v=np.asarray(target_batch["s_v"], dtype=float),
             ego_s=np.asarray(ego_batch["s"], dtype=float),
             ego_l=np.asarray(ego_batch["l"], dtype=float),
+            target_cost_function=target_cost,
         )
 
         collision_cost = self._batch_topk_max(collision_running, 0.15)
@@ -505,8 +523,13 @@ class GameParametricPlanner(Planner):
             overlap = np.maximum(overlap, mask.astype(float))
         return {"collision_running": running, "collision_overlap": overlap}
 
-    def _target_road_terms_batch(self, l: np.ndarray, problem: PlanningProblem) -> tuple[np.ndarray, np.ndarray]:
-        cfg = self.target_cost_function.config
+    def _target_road_terms_batch(
+        self,
+        l: np.ndarray,
+        problem: PlanningProblem,
+        target_cost_function: Optional[VehicleGameCost] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cfg = (target_cost_function or self.target_cost_function).config
         half_width = 0.5 * float(cfg.vehicle_width)
         left = max(float(problem.road_boundary.left_l), float(problem.road_boundary.right_l))
         right = min(float(problem.road_boundary.left_l), float(problem.road_boundary.right_l))
@@ -524,8 +547,13 @@ class GameParametricPlanner(Planner):
         )
         return np.asarray(running, dtype=float), np.asarray(excess > 1e-6, dtype=float)
 
-    def _target_speed_terms_batch(self, s_v: np.ndarray, problem: PlanningProblem) -> tuple[np.ndarray, np.ndarray]:
-        cfg = self.target_cost_function.config
+    def _target_speed_terms_batch(
+        self,
+        s_v: np.ndarray,
+        problem: PlanningProblem,
+        target_cost_function: Optional[VehicleGameCost] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cfg = (target_cost_function or self.target_cost_function).config
         max_speed = max(float(cfg.max_speed), 1e-3)
         target = float(dict(problem.metadata or {}).get("target_speed", max_speed))
         comfort = max(float(cfg.speed_tracking_comfort), 1e-3)
@@ -541,8 +569,13 @@ class GameParametricPlanner(Planner):
         )
         return np.asarray(target_cost + limit_cost, dtype=float), np.asarray((reverse > 1e-6) | (excess > 1e-6), dtype=float)
 
-    def _target_comfort_terms_batch(self, s_a: np.ndarray, t: np.ndarray) -> np.ndarray:
-        cfg = self.target_cost_function.config
+    def _target_comfort_terms_batch(
+        self,
+        s_a: np.ndarray,
+        t: np.ndarray,
+        target_cost_function: Optional[VehicleGameCost] = None,
+    ) -> np.ndarray:
+        cfg = (target_cost_function or self.target_cost_function).config
         accel_cost = pseudo_huber(s_a / max(float(cfg.acceleration_comfort), 1e-3), delta=1.0)
         if s_a.shape[1] >= 2:
             edge_order = 2 if s_a.shape[1] >= 3 else 1
@@ -551,13 +584,23 @@ class GameParametricPlanner(Planner):
             return np.asarray(0.6 * accel_cost + 0.4 * jerk_cost, dtype=float)
         return np.asarray(accel_cost, dtype=float)
 
-    def _target_lane_terms_batch(self, l: np.ndarray, problem: PlanningProblem) -> np.ndarray:
-        cfg = self.target_cost_function.config
+    def _target_lane_terms_batch(
+        self,
+        l: np.ndarray,
+        problem: PlanningProblem,
+        target_cost_function: Optional[VehicleGameCost] = None,
+    ) -> np.ndarray:
+        cfg = (target_cost_function or self.target_cost_function).config
         target_l = float(dict(problem.metadata or {}).get("reference_l", problem.ego.l))
         return np.asarray(pseudo_huber((l - target_l) / max(float(cfg.lane_keep_comfort), 1e-3), delta=1.0), dtype=float)
 
-    def _target_prior_terms_batch(self, s_v: np.ndarray, problem: PlanningProblem) -> np.ndarray:
-        cfg = self.target_cost_function.config
+    def _target_prior_terms_batch(
+        self,
+        s_v: np.ndarray,
+        problem: PlanningProblem,
+        target_cost_function: Optional[VehicleGameCost] = None,
+    ) -> np.ndarray:
+        cfg = (target_cost_function or self.target_cost_function).config
         prior_speed = float(dict(problem.metadata or {}).get("prior_speed", problem.ego.s_v))
         return np.asarray(pseudo_huber((s_v - prior_speed) / max(float(cfg.prior_speed_comfort), 1e-3), delta=1.0), dtype=float)
 
@@ -568,8 +611,9 @@ class GameParametricPlanner(Planner):
         target_s_v: np.ndarray,
         ego_s: np.ndarray,
         ego_l: np.ndarray,
+        target_cost_function: Optional[VehicleGameCost] = None,
     ) -> np.ndarray:
-        cfg = self.target_cost_function.config
+        cfg = (target_cost_function or self.target_cost_function).config
         target_s = np.asarray(target_s, dtype=float)
         target_l = np.asarray(target_l, dtype=float)
         target_s_v = np.asarray(target_s_v, dtype=float)

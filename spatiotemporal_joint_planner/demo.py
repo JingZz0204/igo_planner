@@ -11,8 +11,25 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
+from spatiotemporal_joint_planner.belief import (
+    ActorTypeProfile,
+    BayesianTypeFilter,
+    BayesianTypeFilterConfig,
+    default_actor_type_profiles,
+)
 from spatiotemporal_joint_planner.common import ActorPrediction, EgoState, PlannerResult, PlanningProblem, Trajectory
+from spatiotemporal_joint_planner.contingency import (
+    BeliefContinuationConfig,
+    BeliefContinuationEvaluator,
+    RiskAggregator,
+    RiskAggregatorConfig,
+)
 from spatiotemporal_joint_planner.cost import ParametricTrajectoryCost, ParametricTrajectoryCostConfig
+from spatiotemporal_joint_planner.game.bayesian_game_parametric_planner import (
+    BayesianGameParametricPlanner,
+    BayesianGameParametricPlannerConfig,
+)
+from spatiotemporal_joint_planner.game.bayesian_igo_optimizer import BayesianIGOConfig, BayesianIGOOptimizer
 from spatiotemporal_joint_planner.game.game_parametric_planner import GameParametricPlanner, GameParametricPlannerConfig
 from spatiotemporal_joint_planner.game.igo_game_optimizer import GameIGOConfig, GameIGOOptimizer
 from spatiotemporal_joint_planner.optimizer import CMAESConfig, CMAESOptimizer
@@ -217,6 +234,34 @@ def _config_value(args, section_name: str, legacy_name: str, config_name: str, d
     if cli_value is not None:
         return cli_value
     return _config_section(args, section_name).get(config_name, default)
+
+
+def _actor_type_profiles_from_config(args) -> tuple[ActorTypeProfile, ...]:
+    raw_profiles = _config_section(args, "game").get("type_profiles")
+    if not isinstance(raw_profiles, Mapping) or not raw_profiles:
+        return default_actor_type_profiles()
+    defaults = {profile.name: profile for profile in default_actor_type_profiles()}
+    profiles = []
+    for name, raw in raw_profiles.items():
+        values = dict(raw) if isinstance(raw, Mapping) else {}
+        base = defaults.get(str(name), ActorTypeProfile(name=str(name), prior_probability=1.0))
+        profiles.append(
+            ActorTypeProfile(
+                name=str(name),
+                prior_probability=float(values.get("prior_probability", base.prior_probability)),
+                desired_speed_scale=float(values.get("desired_speed_scale", base.desired_speed_scale)),
+                min_follow_gap=float(values.get("min_follow_gap", base.min_follow_gap)),
+                time_headway=float(values.get("time_headway", base.time_headway)),
+                headway_comfort=float(values.get("headway_comfort", base.headway_comfort)),
+                speed_tracking_comfort=float(values.get("speed_tracking_comfort", base.speed_tracking_comfort)),
+                prior_speed_comfort=float(values.get("prior_speed_comfort", base.prior_speed_comfort)),
+                min_terminal_speed=float(values.get("min_terminal_speed", base.min_terminal_speed)),
+                max_terminal_speed=float(values.get("max_terminal_speed", base.max_terminal_speed)),
+                min_terminal_s_offset=float(values.get("min_terminal_s_offset", base.min_terminal_s_offset)),
+                max_terminal_s_offset=float(values.get("max_terminal_s_offset", base.max_terminal_s_offset)),
+            )
+        )
+    return tuple(profiles)
 
 
 def _resolve_demo_runtime_args(args) -> None:
@@ -613,9 +658,8 @@ def _build_planner(args, trajectory_model):
         )
     )
     planner_type = str(_config_section(args, "planner").get("type", "parametric")).lower()
-    if planner_type == "game":
-        game_optimizer = GameIGOOptimizer(
-            GameIGOConfig(
+    if planner_type in {"game", "bayesian_game"}:
+        game_optimizer_config = GameIGOConfig(
                 n_components=_config_value(args, "optimizer", "components", "components", 2),
                 n_samples=_config_value(args, "optimizer", "samples", "samples", 48),
                 n_iterations=_config_value(args, "optimizer", "iters", "iterations", 50),
@@ -656,22 +700,86 @@ def _build_planner(args, trajectory_model):
                     0.002,
                 ),
             )
+        game_section = _config_section(args, "game")
+        common_config = {
+            "target_actor_id": game_section.get("target_actor_id", "target_lane_rear_vehicle"),
+            "candidate_limit": _config_value(args, "planner", "mode_paths", "mode_paths", 8),
+            "max_initial_anchors": _config_value(args, "planner", "max_initial_anchors", "max_initial_anchors", 96),
+            "target_min_terminal_speed": game_section.get("target_min_terminal_speed", 0.0),
+            "target_max_terminal_speed": game_section.get(
+                "target_max_terminal_speed",
+                _config_value(args, "trajectory_model", "max_terminal_speed", "max_terminal_speed", 15.0),
+            ),
+            "target_min_terminal_s_offset": game_section.get("target_min_terminal_s_offset", -10.0),
+            "target_max_terminal_s_offset": game_section.get("target_max_terminal_s_offset", 25.0),
+        }
+        if planner_type == "game":
+            return GameParametricPlanner(
+                ego_trajectory_model=trajectory_model,
+                ego_cost_function=cost,
+                optimizer=GameIGOOptimizer(game_optimizer_config),
+                config=GameParametricPlannerConfig(**common_config),
+            )
+        risk_config = game_section.get("risk", {})
+        risk_config = risk_config if isinstance(risk_config, Mapping) else {}
+        risk_aggregator = RiskAggregator(
+            RiskAggregatorConfig(
+                expected_weight=float(risk_config.get("expected_weight", 1.0)),
+                cvar_weight=float(risk_config.get("cvar_weight", 0.35)),
+                cvar_alpha=float(risk_config.get("cvar_alpha", 0.25)),
+            )
         )
-        return GameParametricPlanner(
+        equilibrium_config = game_section.get("equilibrium", {})
+        equilibrium_config = equilibrium_config if isinstance(equilibrium_config, Mapping) else {}
+        continuation_config = game_section.get("continuation", {})
+        continuation_config = continuation_config if isinstance(continuation_config, Mapping) else {}
+        filter_config = game_section.get("belief_filter", {})
+        filter_config = filter_config if isinstance(filter_config, Mapping) else {}
+        return BayesianGameParametricPlanner(
             ego_trajectory_model=trajectory_model,
             ego_cost_function=cost,
-            optimizer=game_optimizer,
-            config=GameParametricPlannerConfig(
-                target_actor_id=_config_section(args, "game").get("target_actor_id", "target_lane_rear_vehicle"),
-                candidate_limit=_config_value(args, "planner", "mode_paths", "mode_paths", 8),
-                max_initial_anchors=_config_value(args, "planner", "max_initial_anchors", "max_initial_anchors", 96),
-                target_min_terminal_speed=_config_section(args, "game").get("target_min_terminal_speed", 0.0),
-                target_max_terminal_speed=_config_section(args, "game").get(
-                    "target_max_terminal_speed",
-                    _config_value(args, "trajectory_model", "max_terminal_speed", "max_terminal_speed", 15.0),
+            optimizer=BayesianIGOOptimizer(
+                BayesianIGOConfig(
+                    **vars(game_optimizer_config),
+                    equilibrium_check_interval=int(equilibrium_config.get("check_interval", 3)),
+                    equilibrium_regret_tol=float(equilibrium_config.get("regret_tol", 0.08)),
+                    material_type_probability=float(equilibrium_config.get("material_type_probability", 0.05)),
+                    equilibrium_polish_rounds=int(equilibrium_config.get("polish_rounds", 2)),
+                )
+            ),
+            config=BayesianGameParametricPlannerConfig(
+                **common_config,
+                simulated_target_type=str(game_section.get("simulated_target_type", "normal")),
+                min_type_probability_for_feasibility=float(
+                    game_section.get("min_type_probability_for_feasibility", 0.05)
                 ),
-                target_min_terminal_s_offset=_config_section(args, "game").get("target_min_terminal_s_offset", -10.0),
-                target_max_terminal_s_offset=_config_section(args, "game").get("target_max_terminal_s_offset", 25.0),
+            ),
+            type_profiles=_actor_type_profiles_from_config(args),
+            risk_aggregator=risk_aggregator,
+            continuation_evaluator=BeliefContinuationEvaluator(
+                risk_aggregator,
+                BeliefContinuationConfig(
+                    enabled=bool(continuation_config.get("enabled", True)),
+                    observation_time=float(continuation_config.get("observation_time", 0.8)),
+                    position_sigma=float(continuation_config.get("position_sigma", 2.0)),
+                    speed_sigma=float(continuation_config.get("speed_sigma", 1.0)),
+                    acceleration_sigma=float(continuation_config.get("acceleration_sigma", 1.0)),
+                    score_scale=float(continuation_config.get("score_scale", 500.0)),
+                    cost_weight=float(continuation_config.get("cost_weight", 100.0)),
+                ),
+            ),
+            belief_filter=BayesianTypeFilter(
+                BayesianTypeFilterConfig(
+                    position_sigma=float(filter_config.get("position_sigma", 0.8)),
+                    speed_sigma=float(filter_config.get("speed_sigma", 0.5)),
+                    acceleration_sigma=float(filter_config.get("acceleration_sigma", 0.6)),
+                    displacement_sigma=float(filter_config.get("displacement_sigma", 0.5)),
+                    speed_delta_sigma=float(filter_config.get("speed_delta_sigma", 0.35)),
+                    observation_window_seconds=float(filter_config.get("observation_window_seconds", 1.5)),
+                    evidence_gain=float(filter_config.get("evidence_gain", 0.4)),
+                    probability_floor=float(filter_config.get("probability_floor", 0.02)),
+                    forgetting_factor=float(filter_config.get("forgetting_factor", 0.005)),
+                )
             ),
         )
     if planner_type != "parametric":
@@ -1390,11 +1498,31 @@ def main_simulation(args) -> str:
             stop_reason = str(opt_metadata.get("stop_reason", ""))
             nash_summary = ""
             if opt_metadata.get("nash_check", False):
+                target_regrets = [
+                    float(value)
+                    for key, value in opt_metadata.items()
+                    if str(key).startswith("target_rear") and str(key).endswith("_nash_regret")
+                ]
+                target_regret = max(target_regrets) if target_regrets else float("inf")
                 nash_summary = (
                     f" feas={float(opt_metadata.get('selected_joint_feasible', 0.0)):.0f}"
                     f" nash={float(opt_metadata.get('max_nash_regret', float('inf'))):.3f}"
                     f" ego_reg={float(opt_metadata.get('ego_nash_regret', float('inf'))):.3f}"
-                    f" target_reg={float(opt_metadata.get('target_rear_nash_regret', float('inf'))):.3f}"
+                    f" target_reg={target_regret:.3f}"
+                    f" joint_shift={float(opt_metadata.get('joint_theta_window_shift', float('inf'))):.3f}"
+                )
+            elif opt_metadata.get("bayesian_equilibrium_check", False):
+                target_regrets = [
+                    float(value)
+                    for key, value in opt_metadata.items()
+                    if str(key).endswith("_target_bayesian_regret")
+                ]
+                target_regret = max(target_regrets) if target_regrets else float("inf")
+                nash_summary = (
+                    f" bayes_eq={float(opt_metadata.get('bayesian_equilibrium_converged', 0.0)):.0f}"
+                    f" bayes_reg={float(opt_metadata.get('max_bayesian_regret', float('inf'))):.3f}"
+                    f" ego_reg={float(opt_metadata.get('ego_bayesian_regret', float('inf'))):.3f}"
+                    f" target_reg={target_regret:.3f}"
                     f" joint_shift={float(opt_metadata.get('joint_theta_window_shift', float('inf'))):.3f}"
                 )
             target_cost = result.metadata.get("game_target_cost") if result.metadata else None
@@ -1425,6 +1553,12 @@ def main_simulation(args) -> str:
                         else f" target_exec_v={target_exec_v:.2f} target_end_v={target_end_v:.2f}"
                     )
                 )
+            belief = result.metadata.get("game_target_type_belief") if result.metadata else None
+            belief_summary = ""
+            if isinstance(belief, Mapping):
+                belief_summary = " belief=" + str(
+                    {str(name): round(float(value), 3) for name, value in belief.items()}
+                )
             print(
                 f"step={step:03d} time={elapsed_ms:8.2f} ms status={result.status:>15s} "
                 f"iter={executed_iters:02d}/{max_iters:02d} stop={stop_reason:<36s} "
@@ -1442,9 +1576,11 @@ def main_simulation(args) -> str:
                 f"tf={terms.get('terminal_future_feasibility_score', 0.0):.3f} "
                 f"tr={terms.get('terminal_recoverability_score', 0.0):.3f} "
                 f"tp={terms.get('terminal_progress_score', 0.0):.3f} "
-                f"ts={terms.get('terminal_speed_score', 0.0):.3f}"
+                f"ts={terms.get('terminal_speed_score', 0.0):.3f} "
+                f"ic={terms.get('implicit_contingency_score', 0.0):.3f}"
                 f"{nash_summary}"
                 f"{target_summary}"
+                f"{belief_summary}"
             )
 
         video_frame = None

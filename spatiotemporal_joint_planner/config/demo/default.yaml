@@ -74,6 +74,60 @@ game:
   target_max_terminal_speed: 15.0
   target_min_terminal_s_offset: -10.0
   target_max_terminal_s_offset: 25.0
+  simulated_target_type: normal
+  min_type_probability_for_feasibility: 0.05
+  risk:
+    expected_weight: 1.0
+    cvar_weight: 0.35
+    cvar_alpha: 0.25
+  equilibrium:
+    check_interval: 3
+    regret_tol: 0.08
+    material_type_probability: 0.05
+    polish_rounds: 2
+  continuation:
+    enabled: true
+    observation_time: 0.8
+    position_sigma: 2.0
+    speed_sigma: 1.0
+    acceleration_sigma: 1.0
+    score_scale: 500.0
+    cost_weight: 100.0
+  belief_filter:
+    position_sigma: 0.8
+    speed_sigma: 0.5
+    acceleration_sigma: 0.6
+    displacement_sigma: 0.5
+    speed_delta_sigma: 0.35
+    observation_window_seconds: 1.5
+    evidence_gain: 0.4
+    probability_floor: 0.02
+    forgetting_factor: 0.005
+  type_profiles:
+    yielding:
+      prior_probability: 0.30
+      desired_speed_scale: 0.72
+      min_follow_gap: 8.0
+      time_headway: 1.7
+      headway_comfort: 3.0
+      min_terminal_s_offset: -18.0
+      max_terminal_s_offset: 12.0
+    normal:
+      prior_probability: 0.45
+      desired_speed_scale: 1.0
+      min_follow_gap: 6.0
+      time_headway: 1.2
+      headway_comfort: 4.0
+      min_terminal_s_offset: -10.0
+      max_terminal_s_offset: 25.0
+    aggressive:
+      prior_probability: 0.25
+      desired_speed_scale: 1.18
+      min_follow_gap: 3.5
+      time_headway: 0.7
+      headway_comfort: 5.0
+      min_terminal_s_offset: -2.0
+      max_terminal_s_offset: 36.0
 
 visualization:
   save_frame: null

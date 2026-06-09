@@ -146,6 +146,46 @@ joint_trajectory = {
 
 在评估自车 cost 时，目标车不再是固定预测，而是由 `target_rear` player 的优化轨迹生成动态碰撞约束。这样自车轨迹会和目标车的博弈轨迹进行时间对齐的碰撞检测。
 
+### 第一阶段隐式 Contingency
+
+`BayesianGameParametricPlanner` 在普通联合博弈上增加了潜在行为类型与风险聚合。当前目标后车包含三种可配置假设：
+
+```text
+yielding
+normal
+aggressive
+```
+
+一次优化中的联合参数为：
+
+```text
+joint_theta = {
+  ego: shared_ego_theta,
+  target_rear_yielding: yielding_theta,
+  target_rear_normal: normal_theta,
+  target_rear_aggressive: aggressive_theta
+}
+```
+
+三种类型共享同一条自车决策，但各自优化条件响应轨迹。对每个自车候选，规划器先得到类型条件 cost `J_ego(theta_ego, theta_type)`，再聚合为：
+
+```text
+J_contingency = expected_weight * E_belief[J]
+              + cvar_weight * CVaR_alpha[J]
+```
+
+其中期望项关注常见情况，CVaR 项提高对低概率高损失行为的敏感度。闭环执行时只执行共享自车轨迹和配置的隐藏真实类型轨迹；下一帧通过固定时间窗贝叶斯滤波更新 belief，再重新规划。
+
+belief 证据使用最近时间窗内的纵向位置、速度、加速度、累计位移和速度变化误差：
+
+```text
+evidence = [s_error, v_error, a_error, delta_s_error, delta_v_error]
+```
+
+`game.belief_filter` 可以调整各特征的 sigma、证据窗长度和 `evidence_gain`。更小的 sigma 或更大的 `evidence_gain` 会更快区分类型，但也更容易因短时噪声产生过度自信；`probability_floor` 和 `forgetting_factor` 用于保留类型切换与误判恢复能力。
+
+该实现没有显式生成轨迹分叉树，但自车决策在每一帧都同时考虑多种他车响应，并依靠滚动规划和 belief 更新形成第一阶段隐式 contingency。
+
 ### IGO Game Optimizer
 
 博弈优化器是：
@@ -336,6 +376,19 @@ python -B -m spatiotemporal_joint_planner.demo \
   --show
 ```
 
+第一阶段隐式 contingency 使用 `bayesian_game`。规划器只共享并执行一条自车轨迹，但会同时优化不同后车行为类型下的响应，并通过 belief 加权期望与 CVaR 选择更稳健的自车决策：
+
+```bash
+python -B -m spatiotemporal_joint_planner.demo \
+  --scenario interactive_lane_change \
+  --trajectory-model lattice_trajectory \
+  --set planner.type=bayesian_game \
+  --set game.simulated_target_type=aggressive \
+  --show
+```
+
+其中 `game.simulated_target_type` 仅用于仿真闭环中的隐藏真实类型；规划器决策时只能使用并逐帧更新 `yielding / normal / aggressive` 的类型信念。
+
 ### 当前限制
 
 当前博弈模块仍然是原型实现，主要限制包括：
@@ -344,7 +397,8 @@ python -B -m spatiotemporal_joint_planner.demo \
 - 目标车当前只做纵向参数化，不做横向变道。
 - 目标车行为不是完整意图预测，而是在给定车道内优化 `[s_end, v_end]`。
 - Nash 检查是采样候选上的近似检查，不是解析 Nash 证明。
-- 当前没有显式 contingency planning，也没有多模态分叉轨迹。
+- 当前支持第一阶段隐式 contingency：在共享自车决策下，对 yielding、normal、aggressive 等后车类型分别优化响应，并用 belief 加权期望与 CVaR 聚合自车风险。
+- 当前没有显式共享前缀与多模态分叉轨迹；类型信念通过闭环观测进行贝叶斯更新。
 - 当前 joint candidate selection 仍然偏 ego-prioritized，后续可以扩展为更严格的 equilibrium selection 或 social welfare selection。
 
 ## 可视化效果
