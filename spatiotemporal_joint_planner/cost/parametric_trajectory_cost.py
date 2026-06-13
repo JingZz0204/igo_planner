@@ -120,7 +120,77 @@ class ParametricTrajectoryCost(CostFunction):
     def name(self) -> str:
         return "parametric_trajectory_cost"
 
+    @staticmethod
+    def _validate_trajectory(trajectory: Trajectory) -> None:
+        required = ("t", "s", "l", "s_v", "l_v", "l_a", "kappa")
+        arrays = {}
+        for field_name in required:
+            value = getattr(trajectory, field_name)
+            if value is None:
+                raise ValueError(f"Parametric trajectory cost requires trajectory.{field_name}.")
+            array = np.asarray(value, dtype=float).reshape(-1)
+            if array.size == 0:
+                raise ValueError(f"Parametric trajectory cost requires non-empty trajectory.{field_name}.")
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"Parametric trajectory cost requires finite trajectory.{field_name}.")
+            arrays[field_name] = array
+
+        expected = arrays["t"].size
+        mismatched = {name: values.size for name, values in arrays.items() if values.size != expected}
+        if mismatched:
+            raise ValueError(
+                f"Parametric trajectory fields must share length {expected}; mismatched lengths: {mismatched}."
+            )
+        if expected < 2:
+            raise ValueError("Parametric trajectory cost requires at least two trajectory samples.")
+        if np.any(np.diff(arrays["t"]) <= 0.0):
+            raise ValueError("Parametric trajectory timestamps must be strictly increasing.")
+
+    @staticmethod
+    def _validate_trajectory_batch(trajectory_batch: dict) -> None:
+        required = ("t", "s", "l", "s_v", "l_v", "l_a", "kappa")
+        missing = [name for name in required if name not in trajectory_batch or trajectory_batch[name] is None]
+        if missing:
+            raise ValueError(f"Vectorized parametric trajectory cost is missing batch fields: {missing}.")
+
+        sample_shape = None
+        for field_name in ("s", "l", "s_v", "l_v", "l_a", "kappa"):
+            values = np.asarray(trajectory_batch[field_name], dtype=float)
+            if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] < 2:
+                raise ValueError(
+                    f"Vectorized trajectory field {field_name!r} must have shape [batch, samples>=2], "
+                    f"got {values.shape}."
+                )
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"Vectorized trajectory field {field_name!r} must contain only finite values.")
+            if sample_shape is None:
+                sample_shape = values.shape
+            elif values.shape != sample_shape:
+                raise ValueError(
+                    f"Vectorized trajectory fields must share shape {sample_shape}; "
+                    f"{field_name!r} has shape {values.shape}."
+                )
+
+        t = np.asarray(trajectory_batch["t"], dtype=float)
+        if t.ndim == 1:
+            if t.size != sample_shape[1]:
+                raise ValueError(
+                    f"Vectorized trajectory timestamps must have {sample_shape[1]} samples, got {t.size}."
+                )
+            if not np.all(np.isfinite(t)) or np.any(np.diff(t) <= 0.0):
+                raise ValueError("Vectorized trajectory timestamps must be finite and strictly increasing.")
+        elif t.ndim == 2:
+            if t.shape != sample_shape:
+                raise ValueError(
+                    f"Vectorized trajectory timestamp shape must be {sample_shape}, got {t.shape}."
+                )
+            if not np.all(np.isfinite(t)) or np.any(np.diff(t, axis=1) <= 0.0):
+                raise ValueError("Every vectorized trajectory timestamp row must be finite and strictly increasing.")
+        else:
+            raise ValueError(f"Vectorized trajectory timestamps must be one- or two-dimensional, got {t.shape}.")
+
     def evaluate(self, trajectory: Trajectory, problem: PlanningProblem) -> CostResult:
+        self._validate_trajectory(trajectory)
         blocked_ranges = self._blocked_ranges(problem)
         running_terms = self._markov_running_terms(trajectory, problem, blocked_ranges)
         global_terms = self._global_hierarchy_terms(running_terms)
@@ -334,6 +404,7 @@ class ParametricTrajectoryCost(CostFunction):
     def evaluate_batch(self, trajectory_batch: dict, problem: PlanningProblem) -> np.ndarray:
         """Vectorized total-cost evaluation for trajectory array batches."""
 
+        self._validate_trajectory_batch(trajectory_batch)
         blocked_ranges = self._blocked_ranges(problem)
         terms = self._lattice_batch_running_terms(trajectory_batch, problem, blocked_ranges)
         scores = self._lattice_batch_hierarchy_scores(terms)
@@ -362,7 +433,8 @@ class ParametricTrajectoryCost(CostFunction):
                 + 1.0e1 * scores["comfort_score"]
             )
         total = np.asarray(hard_hierarchy_cost + soft_hierarchy_cost, dtype=float)
-        total[~np.isfinite(total)] = float("inf")
+        if not np.all(np.isfinite(total)):
+            raise FloatingPointError("Vectorized parametric trajectory cost produced non-finite values.")
         return total
 
     def _lattice_batch_running_terms(
@@ -374,13 +446,9 @@ class ParametricTrajectoryCost(CostFunction):
         s = np.asarray(trajectory_batch["s"], dtype=float)
         l = np.asarray(trajectory_batch["l"], dtype=float)
         t = np.asarray(trajectory_batch["t"], dtype=float)
-        s_v = np.asarray(trajectory_batch.get("s_v"), dtype=float)
-        l_a = np.asarray(trajectory_batch.get("l_a"), dtype=float)
-        kappa = trajectory_batch.get("kappa")
-        if kappa is None:
-            kappa_values = np.zeros_like(s, dtype=float)
-        else:
-            kappa_values = np.asarray(kappa, dtype=float)
+        s_v = np.asarray(trajectory_batch["s_v"], dtype=float)
+        l_a = np.asarray(trajectory_batch["l_a"], dtype=float)
+        kappa_values = np.asarray(trajectory_batch["kappa"], dtype=float)
         dkappa = self._batch_dkappa_values(trajectory_batch, kappa_values)
         lateral_jerk = self._batch_gradient(l_a, t)
 
@@ -554,9 +622,7 @@ class ParametricTrajectoryCost(CostFunction):
             return time
         if time.ndim == 1 and len(target_shape) == 2 and time.size == target_shape[1]:
             return np.broadcast_to(time[None, :], target_shape)
-        if time.size == 1:
-            return np.full(target_shape, float(time.reshape(-1)[0]), dtype=float)
-        return np.broadcast_to(time.reshape(1, -1), target_shape)
+        raise ValueError(f"Trajectory timestamp shape {time.shape} cannot align with batch shape {target_shape}.")
 
     @staticmethod
     def _blocked_value_at_times(blocked: dict, key: str, times: np.ndarray) -> np.ndarray:
@@ -565,16 +631,10 @@ class ParametricTrajectoryCost(CostFunction):
         if not temporal:
             return np.full(times.shape, float(blocked[key]), dtype=float)
 
-        source_t = np.asarray(temporal.get("t", []), dtype=float).reshape(-1)
-        source_v = np.asarray(temporal.get(key, []), dtype=float).reshape(-1)
-        if source_t.size == 0 or source_v.size == 0:
-            return np.full(times.shape, float(blocked[key]), dtype=float)
-        n = min(source_t.size, source_v.size)
-        source_t = source_t[:n]
-        source_v = source_v[:n]
-        order = np.argsort(source_t)
-        source_t = source_t[order]
-        source_v = source_v[order]
+        source_t = np.asarray(temporal["t"], dtype=float).reshape(-1)
+        source_v = np.asarray(temporal[key], dtype=float).reshape(-1)
+        if source_t.size != source_v.size or source_t.size == 0:
+            raise ValueError(f"Temporal blocked range field {key!r} must align with non-empty timestamps.")
         flat = np.interp(times.reshape(-1), source_t, source_v, left=source_v[0], right=source_v[-1])
         return flat.reshape(times.shape)
 
@@ -669,12 +729,11 @@ class ParametricTrajectoryCost(CostFunction):
             return np.zeros((s.shape[0],), dtype=float)
 
         l = np.asarray(trajectory_batch["l"], dtype=float)
-        s_v = np.asarray(trajectory_batch.get("s_v"), dtype=float)
-        l_v = np.asarray(trajectory_batch.get("l_v"), dtype=float)
-        l_a = np.asarray(trajectory_batch.get("l_a"), dtype=float)
+        s_v = np.asarray(trajectory_batch["s_v"], dtype=float)
+        l_v = np.asarray(trajectory_batch["l_v"], dtype=float)
+        l_a = np.asarray(trajectory_batch["l_a"], dtype=float)
         t = np.asarray(trajectory_batch["t"], dtype=float)
-        kappa = trajectory_batch.get("kappa")
-        kappa_values = np.zeros_like(s, dtype=float) if kappa is None else np.asarray(kappa, dtype=float)
+        kappa_values = np.asarray(trajectory_batch["kappa"], dtype=float)
         dkappa = self._batch_dkappa_values(trajectory_batch, kappa_values)
         lateral_jerk = self._batch_gradient(l_a, t)
 
@@ -862,27 +921,20 @@ class ParametricTrajectoryCost(CostFunction):
         l_v: np.ndarray,
         t: np.ndarray,
     ) -> np.ndarray:
+        del s_v, l_v
         tail_time = max(float(self.config.terminal_tail_time), 0.0)
         mask = t >= float(t[-1]) - tail_time
-        if np.count_nonzero(mask) >= 2:
-            s_tail = s[:, mask]
-            l_tail = l[:, mask]
-            s_mean = np.mean(s_tail, axis=1, keepdims=True)
-            l_mean = np.mean(l_tail, axis=1, keepdims=True)
-            denom = np.sum((s_tail - s_mean) ** 2, axis=1)
-            numer = np.sum((s_tail - s_mean) * (l_tail - l_mean), axis=1)
-            slope = np.divide(numer, denom, out=np.zeros_like(numer), where=denom > 1e-9)
-            good = denom > 1e-9
-        else:
-            slope = np.zeros((s.shape[0],), dtype=float)
-            good = np.zeros((s.shape[0],), dtype=bool)
-        velocity_slope = np.divide(l_v[:, -1], s_v[:, -1], out=np.zeros_like(l_v[:, -1]), where=np.abs(s_v[:, -1]) > 1e-6)
-        if s.shape[1] >= 2:
-            ds = s[:, -1] - s[:, -2]
-            diff_slope = np.divide(l[:, -1] - l[:, -2], ds, out=velocity_slope.copy(), where=np.abs(ds) > 1e-6)
-        else:
-            diff_slope = velocity_slope
-        return np.where(good, slope, diff_slope)
+        if np.count_nonzero(mask) < 2:
+            raise ValueError("Terminal slope estimation requires at least two samples inside terminal_tail_time.")
+        s_tail = s[:, mask]
+        l_tail = l[:, mask]
+        s_mean = np.mean(s_tail, axis=1, keepdims=True)
+        l_mean = np.mean(l_tail, axis=1, keepdims=True)
+        denom = np.sum((s_tail - s_mean) ** 2, axis=1)
+        if np.any(denom <= 1e-9):
+            raise ValueError("Terminal slope estimation requires longitudinal motion inside terminal_tail_time.")
+        numer = np.sum((s_tail - s_mean) * (l_tail - l_mean), axis=1)
+        return numer / denom
 
     def _batch_dkappa_values(self, trajectory_batch: dict, kappa: np.ndarray) -> np.ndarray:
         x = trajectory_batch.get("x")
@@ -910,16 +962,12 @@ class ParametricTrajectoryCost(CostFunction):
         for row in range(values.shape[0]):
             row_values = values[row]
             row_coordinate = coordinate[row]
-            finite = np.isfinite(row_values) & np.isfinite(row_coordinate)
-            if np.count_nonzero(finite) < 2:
-                continue
-            finite_indices = np.where(finite)[0]
-            local_values = row_values[finite]
-            local_coordinate = row_coordinate[finite]
-            if np.any(np.diff(local_coordinate) <= 1e-6):
-                local_coordinate = np.arange(local_values.size, dtype=float)
-            edge_order = 2 if local_values.size >= 3 else 1
-            out[row, finite_indices] = np.gradient(local_values, local_coordinate, edge_order=edge_order)
+            if not np.all(np.isfinite(row_values)) or not np.all(np.isfinite(row_coordinate)):
+                raise ValueError("Trajectory derivative inputs must contain only finite values.")
+            if np.any(np.diff(row_coordinate) <= 1e-6):
+                raise ValueError("Trajectory derivative coordinate must be strictly increasing.")
+            edge_order = 2 if row_values.size >= 3 else 1
+            out[row] = np.gradient(row_values, row_coordinate, edge_order=edge_order)
         return out
 
     @staticmethod
@@ -1033,20 +1081,6 @@ class ParametricTrajectoryCost(CostFunction):
         blocked_ranges: Sequence[dict],
     ) -> dict:
         terminal = self._terminal_state_features(trajectory)
-        if terminal is None:
-            terms = self._zero_trajectory_certificate_terms()
-            terms.update(
-                {
-                    "terminal_value_cost": 1.0,
-                    "terminal_value_score": 1.0,
-                    "terminal_future_feasibility_score": 1.0,
-                    "terminal_recoverability_score": 1.0,
-                    "terminal_progress_score": 1.0,
-                    "terminal_speed_score": 1.0,
-                }
-            )
-            return {key: terms[key] for key in terms if key.startswith("terminal_")}
-
         s_t = float(terminal["s"])
         l_t = float(terminal["l"])
         v_t = max(float(terminal["v"]), 0.0)
@@ -1115,25 +1149,18 @@ class ParametricTrajectoryCost(CostFunction):
         del trajectory, problem, blocked_ranges
         return {"certificate_slack_score": 0.0}
 
-    def _terminal_state_features(self, trajectory: Trajectory) -> Optional[dict]:
+    def _terminal_state_features(self, trajectory: Trajectory) -> dict:
         s_values = np.asarray(trajectory.s, dtype=float).reshape(-1)
         l_values = np.asarray(trajectory.l, dtype=float).reshape(-1)
-        n = min(s_values.size, l_values.size)
-        if n == 0:
-            return None
-
-        finite = np.isfinite(s_values[:n]) & np.isfinite(l_values[:n])
-        if not np.any(finite):
-            return None
-        idx = int(np.where(finite)[0][-1])
+        idx = int(s_values.size - 1)
         s_t = float(s_values[idx])
         l_t = float(l_values[idx])
         dl_ds_t = self._terminal_dl_ds(trajectory, idx)
-        v_t = self._trajectory_speed_at_index(trajectory, idx)
-        kappa_t = self._last_finite(trajectory.kappa, default=0.0)
-        dkappa_t = self._last_finite(self._dkappa_values(trajectory), default=0.0)
-        lateral_accel_t = self._last_finite(self._lateral_acceleration_values(trajectory), default=0.0)
-        lateral_jerk_t = self._last_finite(self._lateral_jerk_values(trajectory), default=0.0)
+        v_t = float(np.asarray(trajectory.s_v, dtype=float).reshape(-1)[idx])
+        kappa_t = float(np.asarray(trajectory.kappa, dtype=float).reshape(-1)[idx])
+        dkappa_t = float(self._dkappa_values(trajectory)[-1])
+        lateral_accel_t = float(np.asarray(trajectory.l_a, dtype=float).reshape(-1)[idx])
+        lateral_jerk_t = float(self._lateral_jerk_values(trajectory)[-1])
         return {
             "s": s_t,
             "l": l_t,
@@ -1150,7 +1177,7 @@ class ParametricTrajectoryCost(CostFunction):
         l_values = np.asarray(trajectory.l, dtype=float).reshape(-1)
         n = min(s_values.size, l_values.size, int(terminal_idx) + 1)
         if n < 2:
-            return self._velocity_dl_ds(trajectory, terminal_idx)
+            raise ValueError("Terminal slope estimation requires at least two trajectory samples.")
 
         indices = np.arange(n, dtype=int)
         if trajectory.t is not None:
@@ -1159,53 +1186,13 @@ class ParametricTrajectoryCost(CostFunction):
                 tail_time = max(float(self.config.terminal_tail_time), 0.0)
                 indices = indices[t_values[:n] >= float(t_values[terminal_idx]) - tail_time]
         if indices.size < 2:
-            indices = np.arange(max(0, n - min(n, 10)), n, dtype=int)
+            raise ValueError("Terminal slope estimation requires at least two samples inside terminal_tail_time.")
 
         s_tail = s_values[indices]
         l_tail = l_values[indices]
-        finite = np.isfinite(s_tail) & np.isfinite(l_tail)
-        if np.count_nonzero(finite) >= 2:
-            s_tail = s_tail[finite]
-            l_tail = l_tail[finite]
-            if float(np.max(s_tail) - np.min(s_tail)) > 1e-6:
-                try:
-                    return float(np.polyfit(s_tail, l_tail, deg=1)[0])
-                except (ValueError, np.linalg.LinAlgError):
-                    pass
-
-        if n >= 2 and np.isfinite(s_values[n - 1]) and np.isfinite(s_values[n - 2]):
-            ds = float(s_values[n - 1] - s_values[n - 2])
-            if abs(ds) > 1e-6:
-                return float((l_values[n - 1] - l_values[n - 2]) / ds)
-        return self._velocity_dl_ds(trajectory, terminal_idx)
-
-    @staticmethod
-    def _velocity_dl_ds(trajectory: Trajectory, idx: int) -> float:
-        if trajectory.s_v is None or trajectory.l_v is None:
-            return 0.0
-        s_v = np.asarray(trajectory.s_v, dtype=float).reshape(-1)
-        l_v = np.asarray(trajectory.l_v, dtype=float).reshape(-1)
-        if idx >= s_v.size or idx >= l_v.size:
-            return 0.0
-        if not np.isfinite(s_v[idx]) or abs(float(s_v[idx])) < 1e-6 or not np.isfinite(l_v[idx]):
-            return 0.0
-        return float(l_v[idx] / s_v[idx])
-
-    def _trajectory_speed_at_index(self, trajectory: Trajectory, idx: int) -> float:
-        if trajectory.s_v is not None:
-            s_v = np.asarray(trajectory.s_v, dtype=float).reshape(-1)
-            if idx < s_v.size and np.isfinite(s_v[idx]):
-                return float(s_v[idx])
-        if trajectory.v is not None:
-            v = np.asarray(trajectory.v, dtype=float).reshape(-1)
-            if idx < v.size and np.isfinite(v[idx]):
-                return float(v[idx])
-        if trajectory.s_v is not None and trajectory.l_v is not None:
-            s_v = np.asarray(trajectory.s_v, dtype=float).reshape(-1)
-            l_v = np.asarray(trajectory.l_v, dtype=float).reshape(-1)
-            if idx < s_v.size and idx < l_v.size and np.isfinite(s_v[idx]) and np.isfinite(l_v[idx]):
-                return float(math.hypot(float(s_v[idx]), float(l_v[idx])))
-        return 0.0
+        if float(np.max(s_tail) - np.min(s_tail)) <= 1e-6:
+            raise ValueError("Terminal slope estimation requires longitudinal motion inside terminal_tail_time.")
+        return float(np.polyfit(s_tail, l_tail, deg=1)[0])
 
     def _terminal_recoverability_score(self, terminal: dict, problem: PlanningProblem) -> float:
         center_right, center_left = self._center_lateral_interval(problem)
@@ -1662,26 +1649,7 @@ class ParametricTrajectoryCost(CostFunction):
         }
 
     def _speed_running_terms(self, trajectory: Trajectory, problem: PlanningProblem) -> dict:
-        if trajectory.s_v is not None:
-            s_v = np.asarray(trajectory.s_v, dtype=float)
-        elif trajectory.v is not None:
-            s_v = np.asarray(trajectory.v, dtype=float)
-        else:
-            return {
-                "speed_limit_running": np.array([4.0]),
-                "speed_tracking_running": np.array([4.0]),
-                "speed_max_deviation_running": np.array([4.0]),
-                "efficiency_running": np.array([4.0]),
-                "speed_violation": np.array([1.0]),
-            }
-        if s_v.size == 0:
-            return {
-                "speed_limit_running": np.array([4.0]),
-                "speed_tracking_running": np.array([4.0]),
-                "speed_max_deviation_running": np.array([4.0]),
-                "efficiency_running": np.array([4.0]),
-                "speed_violation": np.array([1.0]),
-            }
+        s_v = np.asarray(trajectory.s_v, dtype=float)
 
         max_speed = max(float(self.config.max_longitudinal_speed), 1e-3)
         comfort = max(float(self.config.speed_tracking_comfort), 1e-3)
@@ -1751,16 +1719,6 @@ class ParametricTrajectoryCost(CostFunction):
         return arr[np.isfinite(arr)]
 
     @staticmethod
-    def _last_finite(values, default: float = 0.0) -> float:
-        if values is None:
-            return float(default)
-        arr = np.asarray(values, dtype=float).reshape(-1)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            return float(default)
-        return float(arr[-1])
-
-    @staticmethod
     def _topk_max_cost(values: np.ndarray, fraction: float) -> float:
         values = np.asarray(values, dtype=float)
         if values.size == 0:
@@ -1781,9 +1739,12 @@ class ParametricTrajectoryCost(CostFunction):
         for key in ("preferred_l", "reference_l", "target_lane_l", "target_l", "lane_change_target_l"):
             if key in metadata:
                 try:
-                    return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                    value = float(metadata[key])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Planning metadata {key!r} must be a finite numeric lateral target.") from exc
+                if not math.isfinite(value):
+                    raise ValueError(f"Planning metadata {key!r} must be a finite numeric lateral target.")
+                return value
         return 0.0
 
     def _target_speed(self, problem: PlanningProblem) -> float:
@@ -1791,9 +1752,12 @@ class ParametricTrajectoryCost(CostFunction):
         for key in ("target_speed", "desired_speed", "speed_limit"):
             if key in metadata:
                 try:
-                    return min(float(metadata[key]), float(self.config.max_longitudinal_speed))
-                except (TypeError, ValueError):
-                    pass
+                    value = float(metadata[key])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Planning metadata {key!r} must be a finite numeric speed.") from exc
+                if not math.isfinite(value):
+                    raise ValueError(f"Planning metadata {key!r} must be a finite numeric speed.")
+                return min(value, float(self.config.max_longitudinal_speed))
         return float(self.config.max_longitudinal_speed)
 
     def _blocked_ranges(self, problem: PlanningProblem) -> list[dict]:
@@ -1801,9 +1765,11 @@ class ParametricTrajectoryCost(CostFunction):
         for actor in problem.actors:
             blocked = self._blocked_range_from_metadata(actor)
             if blocked is None:
-                blocked = self._blocked_range_from_actor_pose(actor, problem)
-            if blocked is not None:
-                ranges.append(self._inflate_blocked_range(blocked))
+                raise ValueError(
+                    f"Actor {actor.actor_id!r} must explicitly provide temporal_blocked_range, "
+                    "blocked_s/l bounds, or an s/l pose in metadata."
+                )
+            ranges.append(self._inflate_blocked_range(blocked))
         return ranges
 
     def _inflate_blocked_range(self, blocked: dict) -> dict:
@@ -1828,7 +1794,7 @@ class ParametricTrajectoryCost(CostFunction):
 
     def _blocked_range_from_metadata(self, actor: ActorPrediction) -> Optional[dict]:
         metadata = dict(actor.metadata or {})
-        temporal = self._temporal_blocked_range_from_metadata(metadata)
+        temporal = self._temporal_blocked_range_from_metadata(metadata, actor_id=actor.actor_id)
         if temporal is not None:
             return {
                 "s_min": float(temporal["s_min"][0]),
@@ -1839,28 +1805,48 @@ class ParametricTrajectoryCost(CostFunction):
                 "temporal": temporal,
             }
         keys = ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")
+        if any(key in metadata for key in keys) and not all(key in metadata for key in keys):
+            missing = [key for key in keys if key not in metadata]
+            raise ValueError(f"Actor {actor.actor_id!r} static blocked range is missing fields: {missing}.")
         if all(key in metadata for key in keys):
-            return {
+            blocked = {
                 "s_min": float(metadata["blocked_s_min"]),
                 "s_max": float(metadata["blocked_s_max"]),
                 "l_min": float(metadata["blocked_l_min"]),
                 "l_max": float(metadata["blocked_l_max"]),
                 "actor_id": actor.actor_id,
             }
+            self._validate_blocked_bounds(blocked, actor.actor_id)
+            return blocked
+        if ("s" in metadata) != ("l" in metadata):
+            raise ValueError(f"Actor {actor.actor_id!r} metadata must provide both s and l.")
         if "s" in metadata and "l" in metadata:
             half_length = 0.5 * float(actor.length)
             half_width = 0.5 * float(actor.width)
-            return {
+            blocked = {
                 "s_min": float(metadata["s"]) - half_length,
                 "s_max": float(metadata["s"]) + half_length,
                 "l_min": float(metadata["l"]) - half_width,
                 "l_max": float(metadata["l"]) + half_width,
                 "actor_id": actor.actor_id,
             }
+            self._validate_blocked_bounds(blocked, actor.actor_id)
+            return blocked
         return None
 
     @staticmethod
-    def _temporal_blocked_range_from_metadata(metadata: dict) -> Optional[dict]:
+    def _validate_blocked_bounds(blocked: dict, actor_id: str) -> None:
+        values = np.asarray(
+            [blocked["s_min"], blocked["s_max"], blocked["l_min"], blocked["l_max"]],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Actor {actor_id!r} blocked range must contain only finite bounds.")
+        if float(blocked["s_min"]) > float(blocked["s_max"]) or float(blocked["l_min"]) > float(blocked["l_max"]):
+            raise ValueError(f"Actor {actor_id!r} blocked range has inverted min/max bounds.")
+
+    @classmethod
+    def _temporal_blocked_range_from_metadata(cls, metadata: dict, actor_id: str = "<unknown>") -> Optional[dict]:
         raw = metadata.get("temporal_blocked_range")
         if raw is None:
             raw = metadata.get("temporal_blocked_ranges")
@@ -1873,10 +1859,10 @@ class ParametricTrajectoryCost(CostFunction):
             source = {}
             try:
                 rows = list(raw)
-            except TypeError:
-                return None
+            except TypeError as exc:
+                raise ValueError(f"Actor {actor_id!r} temporal blocked range must be a mapping or iterable.") from exc
             if not rows:
-                return None
+                raise ValueError(f"Actor {actor_id!r} temporal blocked range must not be empty.")
             for key in ("t", "s_min", "s_max", "l_min", "l_max"):
                 values = []
                 for row in rows:
@@ -1888,100 +1874,20 @@ class ParametricTrajectoryCost(CostFunction):
 
         required = ("t", "s_min", "s_max", "l_min", "l_max")
         if not all(key in source for key in required):
-            return None
+            missing = [key for key in required if key not in source]
+            raise ValueError(f"Actor {actor_id!r} temporal blocked range is missing fields: {missing}.")
 
         arrays = {key: np.asarray(source[key], dtype=float).reshape(-1) for key in required}
-        n = min(arr.size for arr in arrays.values())
-        if n <= 0:
-            return None
-        arrays = {key: arr[:n] for key, arr in arrays.items()}
-        finite = np.ones((n,), dtype=bool)
-        for arr in arrays.values():
-            finite &= np.isfinite(arr)
-        if not np.any(finite):
-            return None
-        arrays = {key: arr[finite] for key, arr in arrays.items()}
-        order = np.argsort(arrays["t"])
-        arrays = {key: arr[order] for key, arr in arrays.items()}
+        lengths = {key: arr.size for key, arr in arrays.items()}
+        if len(set(lengths.values())) != 1 or next(iter(lengths.values())) <= 0:
+            raise ValueError(f"Actor {actor_id!r} temporal blocked range fields need equal non-zero lengths: {lengths}.")
+        if not all(np.all(np.isfinite(arr)) for arr in arrays.values()):
+            raise ValueError(f"Actor {actor_id!r} temporal blocked range must contain only finite values.")
+        if np.any(np.diff(arrays["t"]) < 0.0):
+            raise ValueError(f"Actor {actor_id!r} temporal blocked range timestamps must be non-decreasing.")
+        if np.any(arrays["s_min"] > arrays["s_max"]) or np.any(arrays["l_min"] > arrays["l_max"]):
+            raise ValueError(f"Actor {actor_id!r} temporal blocked range has inverted min/max bounds.")
         return arrays
-
-    def _blocked_range_from_actor_pose(self, actor: ActorPrediction, problem: PlanningProblem) -> Optional[dict]:
-        x_values = np.asarray(actor.x, dtype=float)
-        y_values = np.asarray(actor.y, dtype=float)
-        yaw_values = np.asarray(actor.yaw, dtype=float)
-        if x_values.size == 0 or y_values.size == 0:
-            return None
-        x = float(x_values[0])
-        y = float(y_values[0])
-        yaw = float(yaw_values[0]) if yaw_values.size else 0.0
-        half_l = 0.5 * float(actor.length)
-        half_w = 0.5 * float(actor.width)
-        local = np.array(
-            [
-                [half_l, half_w],
-                [half_l, -half_w],
-                [-half_l, -half_w],
-                [-half_l, half_w],
-            ],
-            dtype=float,
-        )
-        c = math.cos(yaw)
-        s = math.sin(yaw)
-        corners = np.column_stack([x + local[:, 0] * c - local[:, 1] * s, y + local[:, 0] * s + local[:, 1] * c])
-        projected_s, projected_l = self._project_points_to_sl(corners, problem)
-        if projected_s.size == 0 or projected_l.size == 0:
-            return None
-        return {
-            "s_min": float(np.min(projected_s)),
-            "s_max": float(np.max(projected_s)),
-            "l_min": float(np.min(projected_l)),
-            "l_max": float(np.max(projected_l)),
-            "actor_id": actor.actor_id,
-        }
-
-    def _project_points_to_sl(self, points: np.ndarray, problem: PlanningProblem) -> tuple[np.ndarray, np.ndarray]:
-        ref_path = problem.ref_path
-        points = np.asarray(points, dtype=float)
-        if points.size == 0:
-            return np.empty((0,), dtype=float), np.empty((0,), dtype=float)
-        if not hasattr(ref_path, "calc_position") or not hasattr(ref_path, "calc_yaw"):
-            return points[:, 0].copy(), points[:, 1].copy()
-
-        if hasattr(ref_path, "s"):
-            ref_s = np.asarray(ref_path.s, dtype=float)
-        else:
-            ref_s = np.arange(0.0, 300.0, 0.5, dtype=float)
-        if ref_s.size == 0:
-            return np.empty((0,), dtype=float), np.empty((0,), dtype=float)
-
-        ref_xy = []
-        ref_yaw = []
-        valid_s = []
-        for s_value in ref_s:
-            xy = ref_path.calc_position(float(s_value))
-            if xy is None or xy[0] is None or xy[1] is None:
-                continue
-            ref_xy.append([float(xy[0]), float(xy[1])])
-            ref_yaw.append(float(ref_path.calc_yaw(float(s_value))))
-            valid_s.append(float(s_value))
-        if not ref_xy:
-            return np.empty((0,), dtype=float), np.empty((0,), dtype=float)
-
-        ref_xy = np.asarray(ref_xy, dtype=float)
-        ref_yaw = np.asarray(ref_yaw, dtype=float)
-        valid_s = np.asarray(valid_s, dtype=float)
-        out_s = []
-        out_l = []
-        for point in points:
-            diff = ref_xy - point[None, :]
-            idx = int(np.argmin(np.sum(diff * diff, axis=1)))
-            yaw = float(ref_yaw[idx])
-            nx = math.cos(yaw + math.pi / 2.0)
-            ny = math.sin(yaw + math.pi / 2.0)
-            lateral = float((point[0] - ref_xy[idx, 0]) * nx + (point[1] - ref_xy[idx, 1]) * ny)
-            out_s.append(float(valid_s[idx]))
-            out_l.append(lateral)
-        return np.asarray(out_s, dtype=float), np.asarray(out_l, dtype=float)
 
     def _ego_frenet_range(self, s: float, l: float) -> tuple[float, float, float, float]:
         return (
@@ -1996,64 +1902,26 @@ class ParametricTrajectoryCost(CostFunction):
 
     @staticmethod
     def _kappa_values(trajectory: Trajectory) -> np.ndarray:
-        if trajectory.kappa is None:
-            return np.empty((0,), dtype=float)
         kappa = np.asarray(trajectory.kappa, dtype=float).reshape(-1)
         return kappa[np.isfinite(kappa)]
 
     def _dkappa_values(self, trajectory: Trajectory) -> np.ndarray:
-        if trajectory.kappa is None:
-            return np.empty((0,), dtype=float)
         kappa = np.asarray(trajectory.kappa, dtype=float).reshape(-1)
-        if kappa.size < 2:
-            return np.empty((0,), dtype=float)
         coordinate = self._path_coordinate_values(trajectory, kappa.size)
-        n = min(kappa.size, coordinate.size)
-        if n < 2:
-            return np.empty((0,), dtype=float)
-        values = kappa[:n]
-        coordinate = coordinate[:n]
-        finite = np.isfinite(values) & np.isfinite(coordinate)
-        if np.count_nonzero(finite) < 2:
-            return np.empty((0,), dtype=float)
-        return self._gradient_values(values[finite], coordinate[finite])
+        return self._gradient_values(kappa, coordinate)
 
     def _lateral_jerk_values(self, trajectory: Trajectory) -> np.ndarray:
-        if trajectory.l_a is None or trajectory.t is None:
-            return np.empty((0,), dtype=float)
         lateral_accel = np.asarray(trajectory.l_a, dtype=float).reshape(-1)
         t_values = np.asarray(trajectory.t, dtype=float).reshape(-1)
-        n = min(lateral_accel.size, t_values.size)
-        if n < 2:
-            return np.empty((0,), dtype=float)
-        lateral_accel = lateral_accel[:n]
-        t_values = t_values[:n]
-        finite = np.isfinite(lateral_accel) & np.isfinite(t_values)
-        if np.count_nonzero(finite) < 2:
-            return np.empty((0,), dtype=float)
-        return self._gradient_values(lateral_accel[finite], t_values[finite])
+        return self._gradient_values(lateral_accel, t_values)
 
     @staticmethod
     def _path_coordinate_values(trajectory: Trajectory, size: int) -> np.ndarray:
         size = max(int(size), 0)
-        if size == 0:
-            return np.empty((0,), dtype=float)
-        if trajectory.x is not None and trajectory.y is not None:
-            x_values = np.asarray(trajectory.x, dtype=float).reshape(-1)
-            y_values = np.asarray(trajectory.y, dtype=float).reshape(-1)
-            n = min(size, x_values.size, y_values.size)
-            if n >= 2:
-                ds = np.hypot(np.diff(x_values[:n]), np.diff(y_values[:n]))
-                return np.concatenate([[0.0], np.cumsum(ds)])
-        if trajectory.s is not None:
-            s_values = np.asarray(trajectory.s, dtype=float).reshape(-1)
-            if s_values.size:
-                return s_values[: min(size, s_values.size)]
-        if trajectory.t is not None:
-            t_values = np.asarray(trajectory.t, dtype=float).reshape(-1)
-            if t_values.size:
-                return t_values[: min(size, t_values.size)]
-        return np.arange(size, dtype=float)
+        s_values = np.asarray(trajectory.s, dtype=float).reshape(-1)
+        if size < 2 or s_values.size != size:
+            raise ValueError(f"dkappa calculation requires aligned s/kappa samples, got s={s_values.size}, kappa={size}.")
+        return s_values
 
     @staticmethod
     def _gradient_values(values: np.ndarray, coordinate: np.ndarray) -> np.ndarray:
@@ -2065,37 +1933,11 @@ class ParametricTrajectoryCost(CostFunction):
         values = values[:n]
         coordinate = coordinate[:n]
         if np.any(np.diff(coordinate) <= 1e-6):
-            coordinate = np.arange(n, dtype=float)
+            raise ValueError("Trajectory derivative coordinate must be strictly increasing.")
         edge_order = 2 if n >= 3 else 1
         gradient = np.gradient(values, coordinate, edge_order=edge_order)
         return np.asarray(gradient, dtype=float)[np.isfinite(gradient)]
 
     @staticmethod
     def _lateral_acceleration_values(trajectory: Trajectory) -> np.ndarray:
-        if trajectory.l_a is not None:
-            l_a = np.asarray(trajectory.l_a, dtype=float)
-            if l_a.size:
-                return l_a[np.isfinite(l_a)]
-
-        candidates = []
-        if trajectory.kappa is not None:
-            kappa = np.asarray(trajectory.kappa, dtype=float)
-            if trajectory.v is not None:
-                speed = np.asarray(trajectory.v, dtype=float)
-            elif trajectory.s_v is not None and trajectory.l_v is not None:
-                speed = np.hypot(np.asarray(trajectory.s_v, dtype=float), np.asarray(trajectory.l_v, dtype=float))
-            elif trajectory.s_v is not None:
-                speed = np.abs(np.asarray(trajectory.s_v, dtype=float))
-            else:
-                speed = np.empty((0,), dtype=float)
-            n = min(kappa.size, speed.size)
-            if n:
-                candidates.append(speed[:n] * speed[:n] * kappa[:n])
-        if not candidates:
-            return np.empty((0,), dtype=float)
-        n = min(candidate.size for candidate in candidates)
-        if n == 0:
-            return np.empty((0,), dtype=float)
-        stacked = np.vstack([candidate[:n] for candidate in candidates])
-        idx = np.argmax(np.abs(stacked), axis=0)
-        return stacked[idx, np.arange(n)]
+        return np.asarray(trajectory.l_a, dtype=float).reshape(-1)

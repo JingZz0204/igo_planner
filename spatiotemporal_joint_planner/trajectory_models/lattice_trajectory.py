@@ -10,8 +10,6 @@ from spatiotemporal_joint_planner.common import PlanningProblem, Trajectory
 from spatiotemporal_joint_planner.trajectory_models.base import TrajectoryModel
 from spatiotemporal_joint_planner.trajectory_models.common import (
     fixed_time_grid,
-    quartic_profile,
-    quintic_profile,
     trajectory_from_sl,
 )
 
@@ -69,36 +67,16 @@ class LatticeTrajectoryModel(TrajectoryModel):
         theta = np.asarray(parameters, dtype=float)
         if theta.shape != (2,):
             raise ValueError(f"{self.name} expects theta shape (2,), got {theta.shape}")
-
-        low, high = self.bounds(problem)
-        l_end, v_end = np.clip(theta, low, high)
-        t = fixed_time_grid(problem.horizon, problem.dt)
-        s, s_v, s_a = quartic_profile(
-            problem.ego.s,
-            problem.ego.s_v,
-            problem.ego.s_a,
-            float(v_end),
-            t,
-            a1=float(self.config.terminal_longitudinal_accel),
-        )
-        l, l_v, l_a = quintic_profile(
-            problem.ego.l,
-            problem.ego.l_v,
-            problem.ego.l_a,
-            float(l_end),
-            float(self.config.terminal_lateral_speed),
-            float(self.config.terminal_lateral_accel),
-            t,
-        )
-        return trajectory_from_sl(
+        arrays = self.decode_batch_arrays(theta.reshape(1, -1), problem)
+        trajectory = trajectory_from_sl(
             problem,
-            t,
-            s,
-            l,
-            s_v=s_v,
-            l_v=l_v,
-            s_a=s_a,
-            l_a=l_a,
+            arrays["t"],
+            arrays["s"][0],
+            arrays["l"][0],
+            s_v=arrays["s_v"][0],
+            l_v=arrays["l_v"][0],
+            s_a=arrays["s_a"][0],
+            l_a=arrays["l_a"][0],
             metadata={
                 "model": self.name,
                 "parameterization": "terminal_l_end_v_end",
@@ -106,6 +84,8 @@ class LatticeTrajectoryModel(TrajectoryModel):
                 "theta": theta.copy(),
             },
         )
+        trajectory.kappa = np.asarray(arrays["kappa"][0], dtype=float).copy()
+        return trajectory
 
     def decode_batch_arrays(self, parameters_batch: np.ndarray, problem: PlanningProblem) -> dict:
         """Vectorized lattice decode for optimizer-side batch cost evaluation."""
@@ -141,12 +121,8 @@ class LatticeTrajectoryModel(TrajectoryModel):
         )
         x = None
         y = None
-        # x, y = self._xy_from_sl_batch(problem, s, l)
         yaw = None
-        kappa = None
-        if x is not None and y is not None:
-            yaw = np.arctan2(self._finite_difference_batch(y, t), self._finite_difference_batch(x, t))
-            kappa = self._curvature_from_xy_batch(x, y, t)
+        kappa = self._frenet_lateral_curvature_batch(s, l, t)
 
         return {
             "model": self.name,
@@ -251,7 +227,7 @@ class LatticeTrajectoryModel(TrajectoryModel):
         s_values = np.asarray(s_values, dtype=float)
         l_values = np.asarray(l_values, dtype=float)
         if not hasattr(ref_path, "calc_position") or not hasattr(ref_path, "calc_yaw"):
-            return s_values.copy(), l_values.copy()
+            raise TypeError("Lattice SL-to-XY conversion requires a geometric reference path.")
 
         route_end = cls._route_end_s(ref_path)
         x_values = np.empty_like(s_values, dtype=float)
@@ -260,7 +236,7 @@ class LatticeTrajectoryModel(TrajectoryModel):
             s_clamped = float(np.clip(float(s_values[index]), 0.0, route_end))
             xy_ref = ref_path.calc_position(s_clamped)
             if xy_ref is None or xy_ref[0] is None or xy_ref[1] is None:
-                return None, None
+                raise ValueError(f"Reference path returned no position at s={s_clamped:.3f}.")
             yaw = float(ref_path.calc_yaw(s_clamped))
             x_values[index] = float(xy_ref[0]) + float(l_values[index]) * math.cos(yaw + math.pi / 2.0)
             y_values[index] = float(xy_ref[1]) + float(l_values[index]) * math.sin(yaw + math.pi / 2.0)
@@ -276,6 +252,18 @@ class LatticeTrajectoryModel(TrajectoryModel):
         return np.gradient(values, t, axis=-1, edge_order=edge_order)
 
     @classmethod
+    def _frenet_lateral_curvature_batch(cls, s: np.ndarray, l: np.ndarray, t: np.ndarray) -> np.ndarray:
+        s = np.asarray(s, dtype=float)
+        l = np.asarray(l, dtype=float)
+        s_t = cls._finite_difference_batch(s, t)
+        l_t = cls._finite_difference_batch(l, t)
+        s_tt = cls._finite_difference_batch(s_t, t)
+        l_tt = cls._finite_difference_batch(l_t, t)
+        dl_ds = l_t / np.maximum(np.abs(s_t), 1e-3)
+        d2l_ds2 = (l_tt * s_t - l_t * s_tt) / np.maximum(np.abs(s_t) ** 3, 1e-3)
+        return d2l_ds2 / np.maximum((1.0 + dl_ds * dl_ds) ** 1.5, 1e-6)
+
+    @classmethod
     def _curvature_from_xy_batch(cls, x: np.ndarray, y: np.ndarray, t: np.ndarray) -> np.ndarray:
         vx = cls._finite_difference_batch(np.asarray(x, dtype=float), t)
         vy = cls._finite_difference_batch(np.asarray(y, dtype=float), t)
@@ -286,8 +274,9 @@ class LatticeTrajectoryModel(TrajectoryModel):
 
     @staticmethod
     def _route_end_s(ref_path) -> float:
-        if hasattr(ref_path, "s"):
-            values = np.asarray(ref_path.s, dtype=float)
-            if values.size:
-                return max(float(values[-1]), 1e-3)
-        return 1.0e6
+        if not hasattr(ref_path, "s"):
+            raise TypeError("Reference path must expose cumulative arc-length samples through .s.")
+        values = np.asarray(ref_path.s, dtype=float)
+        if not values.size:
+            raise ValueError("Reference path .s must not be empty.")
+        return max(float(values[-1]), 1e-3)

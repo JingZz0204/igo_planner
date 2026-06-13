@@ -51,6 +51,9 @@ class VehicleGameCost:
         problem: PlanningProblem,
         opponent_trajectories: Sequence[Trajectory] = (),
     ) -> CostResult:
+        self._validate_trajectory(trajectory, "optimized vehicle")
+        for idx, opponent in enumerate(opponent_trajectories):
+            self._validate_trajectory(opponent, f"opponent_{idx}")
         blocked_ranges = self._blocked_ranges(problem, opponent_trajectories)
         collision_running, collision_overlap = self._collision_terms(trajectory, blocked_ranges)
         road_running, road_violation = self._road_terms(trajectory, problem)
@@ -112,9 +115,37 @@ class VehicleGameCost:
             metadata={"cost": self.name, "blocked_ranges": blocked_ranges},
         )
 
+    @staticmethod
+    def _validate_trajectory(trajectory: Trajectory, label: str) -> None:
+        required = ("t", "s", "l", "s_v", "s_a")
+        arrays = {}
+        for field_name in required:
+            value = getattr(trajectory, field_name)
+            if value is None:
+                raise ValueError(f"Vehicle game cost requires {label} trajectory.{field_name}.")
+            array = np.asarray(value, dtype=float).reshape(-1)
+            if array.size < 2:
+                raise ValueError(f"Vehicle game cost requires at least two samples in {label} trajectory.{field_name}.")
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"Vehicle game cost requires finite {label} trajectory.{field_name}.")
+            arrays[field_name] = array
+        expected = arrays["t"].size
+        mismatched = {name: values.size for name, values in arrays.items() if values.size != expected}
+        if mismatched:
+            raise ValueError(f"Vehicle game trajectory fields for {label} must share length {expected}: {mismatched}.")
+        if np.any(np.diff(arrays["t"]) <= 0.0):
+            raise ValueError(f"Vehicle game trajectory timestamps for {label} must be strictly increasing.")
+
     def _blocked_ranges(self, problem: PlanningProblem, opponents: Sequence[Trajectory]) -> list[dict]:
-        ranges = [self._blocked_range_from_actor(actor) for actor in problem.actors]
-        ranges = [item for item in ranges if item is not None]
+        ranges = []
+        for actor in problem.actors:
+            blocked = self._blocked_range_from_actor(actor)
+            if blocked is None:
+                raise ValueError(
+                    f"Game actor {actor.actor_id!r} must explicitly provide temporal_blocked_range, "
+                    "blocked_s/l bounds, or an s/l pose in metadata."
+                )
+            ranges.append(blocked)
         for idx, trajectory in enumerate(opponents):
             ranges.append(self._blocked_range_from_trajectory(trajectory, f"opponent_{idx}"))
         return [self._inflate_range(item) for item in ranges]
@@ -122,43 +153,80 @@ class VehicleGameCost:
     def _blocked_range_from_actor(self, actor) -> Optional[dict]:
         metadata = dict(actor.metadata or {})
         temporal = metadata.get("temporal_blocked_range") or metadata.get("temporal_blocked_ranges")
-        if isinstance(temporal, Mapping) and all(key in temporal for key in ("t", "s_min", "s_max", "l_min", "l_max")):
-            arrays = {key: np.asarray(temporal[key], dtype=float).reshape(-1) for key in ("t", "s_min", "s_max", "l_min", "l_max")}
-            n = min(value.size for value in arrays.values())
-            if n > 0:
-                arrays = {key: value[:n] for key, value in arrays.items()}
-                return {
-                    "s_min": float(arrays["s_min"][0]),
-                    "s_max": float(arrays["s_max"][0]),
-                    "l_min": float(arrays["l_min"][0]),
-                    "l_max": float(arrays["l_max"][0]),
-                    "temporal": arrays,
-                    "actor_id": actor.actor_id,
-                }
-        keys = ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")
-        if all(key in metadata for key in keys):
+        if temporal is not None:
+            if not isinstance(temporal, Mapping):
+                raise ValueError(f"Game actor {actor.actor_id!r} temporal blocked range must be a mapping.")
+            required = ("t", "s_min", "s_max", "l_min", "l_max")
+            missing = [key for key in required if key not in temporal]
+            if missing:
+                raise ValueError(f"Game actor {actor.actor_id!r} temporal blocked range is missing fields: {missing}.")
+            arrays = {key: np.asarray(temporal[key], dtype=float).reshape(-1) for key in required}
+            lengths = {key: value.size for key, value in arrays.items()}
+            if len(set(lengths.values())) != 1 or next(iter(lengths.values())) <= 0:
+                raise ValueError(
+                    f"Game actor {actor.actor_id!r} temporal blocked range fields need equal non-zero lengths: "
+                    f"{lengths}."
+                )
+            if not all(np.all(np.isfinite(value)) for value in arrays.values()):
+                raise ValueError(f"Game actor {actor.actor_id!r} temporal blocked range must contain finite values.")
+            if np.any(np.diff(arrays["t"]) < 0.0):
+                raise ValueError(f"Game actor {actor.actor_id!r} temporal blocked timestamps must be non-decreasing.")
+            if np.any(arrays["s_min"] > arrays["s_max"]) or np.any(arrays["l_min"] > arrays["l_max"]):
+                raise ValueError(f"Game actor {actor.actor_id!r} temporal blocked range has inverted min/max bounds.")
             return {
+                "s_min": float(arrays["s_min"][0]),
+                "s_max": float(arrays["s_max"][0]),
+                "l_min": float(arrays["l_min"][0]),
+                "l_max": float(arrays["l_max"][0]),
+                "temporal": arrays,
+                "actor_id": actor.actor_id,
+            }
+        keys = ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")
+        if any(key in metadata for key in keys) and not all(key in metadata for key in keys):
+            missing = [key for key in keys if key not in metadata]
+            raise ValueError(f"Game actor {actor.actor_id!r} static blocked range is missing fields: {missing}.")
+        if all(key in metadata for key in keys):
+            blocked = {
                 "s_min": float(metadata["blocked_s_min"]),
                 "s_max": float(metadata["blocked_s_max"]),
                 "l_min": float(metadata["blocked_l_min"]),
                 "l_max": float(metadata["blocked_l_max"]),
                 "actor_id": actor.actor_id,
             }
+            self._validate_blocked_bounds(blocked)
+            return blocked
+        if ("s" in metadata) != ("l" in metadata):
+            raise ValueError(f"Game actor {actor.actor_id!r} metadata must provide both s and l.")
         if "s" in metadata and "l" in metadata:
-            return {
+            blocked = {
                 "s_min": float(metadata["s"]) - 0.5 * float(actor.length),
                 "s_max": float(metadata["s"]) + 0.5 * float(actor.length),
                 "l_min": float(metadata["l"]) - 0.5 * float(actor.width),
                 "l_max": float(metadata["l"]) + 0.5 * float(actor.width),
                 "actor_id": actor.actor_id,
             }
+            self._validate_blocked_bounds(blocked)
+            return blocked
         return None
+
+    @staticmethod
+    def _validate_blocked_bounds(blocked: dict) -> None:
+        values = np.asarray(
+            [blocked["s_min"], blocked["s_max"], blocked["l_min"], blocked["l_max"]],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Game actor {blocked['actor_id']!r} blocked range must contain finite bounds.")
+        if float(blocked["s_min"]) > float(blocked["s_max"]) or float(blocked["l_min"]) > float(blocked["l_max"]):
+            raise ValueError(f"Game actor {blocked['actor_id']!r} blocked range has inverted min/max bounds.")
 
     def _blocked_range_from_trajectory(self, trajectory: Trajectory, actor_id: str) -> dict:
         s = np.asarray(trajectory.s, dtype=float)
         l = np.asarray(trajectory.l, dtype=float)
         t = np.asarray(trajectory.t, dtype=float)
         n = min(s.size, l.size, t.size)
+        if n < 2 or s.size != l.size or s.size != t.size:
+            raise ValueError(f"Opponent trajectory {actor_id!r} must contain aligned non-empty t/s/l samples.")
         front = float(self.config.vehicle_front)
         rear = float(self.config.vehicle_rear)
         half_width = 0.5 * float(self.config.vehicle_width)
@@ -250,8 +318,6 @@ class VehicleGameCost:
         return np.asarray(running, dtype=float), np.asarray(excess > 1e-6, dtype=float)
 
     def _speed_terms(self, trajectory: Trajectory, problem: PlanningProblem) -> tuple[np.ndarray, np.ndarray]:
-        if trajectory.s_v is None:
-            return np.array([4.0]), np.array([1.0])
         s_v = np.asarray(trajectory.s_v, dtype=float)
         max_speed = max(float(self.config.max_speed), 1e-3)
         target = float(dict(problem.metadata or {}).get("target_speed", max_speed))
@@ -270,8 +336,6 @@ class VehicleGameCost:
 
     def _comfort_terms(self, trajectory: Trajectory) -> np.ndarray:
         t = np.asarray(trajectory.t, dtype=float)
-        if trajectory.s_a is None:
-            return np.array([4.0])
         s_a = np.asarray(trajectory.s_a, dtype=float)
         accel_cost = pseudo_huber(s_a / max(float(self.config.acceleration_comfort), 1e-3), delta=1.0)
         if s_a.size >= 2 and t.size >= s_a.size:
@@ -287,8 +351,6 @@ class VehicleGameCost:
         return np.asarray(pseudo_huber((l - target_l) / max(float(self.config.lane_keep_comfort), 1e-3), delta=1.0), dtype=float)
 
     def _prior_terms(self, trajectory: Trajectory, problem: PlanningProblem) -> np.ndarray:
-        if trajectory.s_v is None:
-            return np.array([4.0])
         prior_speed = float(dict(problem.metadata or {}).get("prior_speed", problem.ego.s_v))
         s_v = np.asarray(trajectory.s_v, dtype=float)
         return np.asarray(pseudo_huber((s_v - prior_speed) / max(float(self.config.prior_speed_comfort), 1e-3), delta=1.0), dtype=float)
@@ -298,7 +360,7 @@ class VehicleGameCost:
         l = np.asarray(trajectory.l, dtype=float)
         if s.size == 0:
             return np.array([0.0], dtype=float)
-        s_v = np.zeros_like(s, dtype=float) if trajectory.s_v is None else np.asarray(trajectory.s_v, dtype=float)
+        s_v = np.asarray(trajectory.s_v, dtype=float)
         n = min(s.size, l.size, s_v.size)
         running = np.zeros((n,), dtype=float)
         if n == 0:
@@ -326,12 +388,11 @@ class VehicleGameCost:
         temporal = blocked.get("temporal")
         if not temporal:
             return np.full(times.shape, float(blocked[key]), dtype=float)
-        source_t = np.asarray(temporal.get("t", []), dtype=float).reshape(-1)
-        source_v = np.asarray(temporal.get(key, []), dtype=float).reshape(-1)
-        n = min(source_t.size, source_v.size)
-        if n == 0:
-            return np.full(times.shape, float(blocked[key]), dtype=float)
-        return np.interp(np.asarray(times, dtype=float), source_t[:n], source_v[:n], left=source_v[0], right=source_v[n - 1])
+        source_t = np.asarray(temporal["t"], dtype=float).reshape(-1)
+        source_v = np.asarray(temporal[key], dtype=float).reshape(-1)
+        if source_t.size != source_v.size or source_t.size == 0:
+            raise ValueError(f"Temporal blocked range field {key!r} must align with non-empty timestamps.")
+        return np.interp(np.asarray(times, dtype=float), source_t, source_v, left=source_v[0], right=source_v[-1])
 
     @staticmethod
     def _topk_max(values: np.ndarray, fraction: float) -> float:

@@ -1,6 +1,5 @@
 from .base import (
-    CompositeWarmStartGenerator,
-    DefaultWarmStartGenerator,
+    ModelWarmStartGenerator,
     WarmStartContext,
     WarmStartGenerator,
     default_parametric_warm_start_generator,
@@ -18,8 +17,7 @@ from .terminal_state import (
 __all__ = [
     "BezierTrajectoryWarmStartConfig",
     "BezierTrajectoryWarmStartGenerator",
-    "CompositeWarmStartGenerator",
-    "DefaultWarmStartGenerator",
+    "ModelWarmStartGenerator",
     "FrenetBezierWarmStartConfig",
     "FrenetBezierWarmStartGenerator",
     "FrenetBSplineWarmStartConfig",

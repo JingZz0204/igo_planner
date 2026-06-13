@@ -35,7 +35,7 @@ from spatiotemporal_joint_planner.trajectory_models import TrajectoryModel
 class GameParametricPlannerConfig:
     target_actor_id: str = "target_lane_rear_vehicle"
     candidate_limit: int = 8
-    max_initial_anchors: int = 96
+    max_initial_anchors: int = 8
     ego_player_name: str = "ego"
     target_player_name: str = "target_rear"
     target_min_terminal_speed: float = 0.0
@@ -240,7 +240,7 @@ class GameParametricPlanner(Planner):
 
         scores = cost._lattice_batch_hierarchy_scores(terms)
         certificate_score = np.zeros_like(scores["efficiency_score"], dtype=float)
-        if bool(cost.config.trajectory_certificate_enabled) and hasattr(cost, "_lattice_batch_certificate_score"):
+        if bool(cost.config.trajectory_certificate_enabled):
             certificate_score = cost._lattice_batch_certificate_score(ego_batch, problem, blocked_ranges)
 
         collision_score = self._saturate_array(scores["collision_cost"], cost.config.collision_score_scale)
@@ -267,7 +267,8 @@ class GameParametricPlanner(Planner):
                 + 1.0e1 * scores["comfort_score"]
             )
         total = np.asarray(hard_hierarchy_cost + soft_hierarchy_cost, dtype=float)
-        total[~np.isfinite(total)] = float("inf")
+        if not np.all(np.isfinite(total)):
+            raise FloatingPointError("Game ego batch cost produced non-finite values.")
         return total
 
     def _evaluate_target_game_batch(
@@ -300,12 +301,9 @@ class GameParametricPlanner(Planner):
             agent_front=float(cfg.vehicle_front),
             agent_rear=float(cfg.vehicle_rear),
             agent_width=float(cfg.vehicle_width),
-            other_front=float(getattr(self.ego_cost_function.config, "ego_front", cfg.vehicle_front))
-            + float(cfg.obstacle_s_buffer),
-            other_rear=float(getattr(self.ego_cost_function.config, "ego_rear", cfg.vehicle_rear))
-            + float(cfg.obstacle_s_buffer),
-            other_width=float(getattr(self.ego_cost_function.config, "ego_width", cfg.vehicle_width))
-            + 2.0 * float(cfg.obstacle_l_buffer),
+            other_front=float(self.ego_cost_function.config.ego_front) + float(cfg.obstacle_s_buffer),
+            other_rear=float(self.ego_cost_function.config.ego_rear) + float(cfg.obstacle_s_buffer),
+            other_width=float(self.ego_cost_function.config.ego_width) + 2.0 * float(cfg.obstacle_l_buffer),
             decay_s=1.0e9,
         )
         collision_running = np.maximum(exo_collision["collision_running"], ego_collision["collision_running"])
@@ -364,7 +362,8 @@ class GameParametricPlanner(Planner):
             + 1.0e1 * comfort_score
         )
         total = np.asarray(total, dtype=float)
-        total[~np.isfinite(total)] = float("inf")
+        if not np.all(np.isfinite(total)):
+            raise FloatingPointError("Game target batch cost produced non-finite values.")
         return total
 
     def reset(self) -> None:
@@ -382,9 +381,14 @@ class GameParametricPlanner(Planner):
             previous_parameters=self._last_ego_parameters,
             max_count=int(self.config.max_initial_anchors),
         )
+        if not self.warm_start_generator.supports(context):
+            raise ValueError(
+                f"Warm-start generator {self.warm_start_generator.name!r} does not support "
+                f"trajectory model {self.ego_trajectory_model.name!r}."
+            )
         seeds = self.warm_start_generator.generate(context)
         if seeds.size == 0:
-            seeds = self.ego_trajectory_model.reference_parameters(problem).reshape(1, -1)
+            raise ValueError(f"No warm-start seeds for trajectory model {self.ego_trajectory_model.name!r}.")
         return GamePlayer(
             name=self.config.ego_player_name,
             role="ego",
@@ -425,23 +429,22 @@ class GameParametricPlanner(Planner):
     ) -> np.ndarray:
         horizon = max(float(problem.horizon), 1e-3)
         nominal_s_end = float(problem.ego.s) + float(problem.ego.s_v) * horizon
-        speed_values = np.linspace(
-            max(float(low[1]), 0.5 * float(problem.ego.s_v)),
-            min(float(high[1]), 1.25 * max(float(problem.ego.s_v), 1e-3)),
-            num=5,
-            dtype=float,
-        )
-        offset_values = np.array([-8.0, -4.0, 0.0, 4.0, 8.0, 14.0], dtype=float)
+        current_speed = float(np.clip(problem.ego.s_v, low[1], high[1]))
+        desired_speed = float(np.clip(dict(problem.metadata or {}).get("target_speed", current_speed), low[1], high[1]))
         seeds = []
         if self._last_target_parameters is not None:
             seeds.append(np.clip(self._last_target_parameters, low, high))
         seeds.append(model.reference_parameters(problem))
-        for offset in offset_values:
-            for speed in speed_values:
-                seeds.append(np.array([nominal_s_end + float(offset), float(speed)], dtype=float))
+        seeds.extend(
+            [
+                np.array([nominal_s_end - 8.0, max(float(low[1]), 0.75 * current_speed)], dtype=float),
+                np.array([nominal_s_end, desired_speed], dtype=float),
+                np.array([nominal_s_end + 8.0, min(float(high[1]), 1.15 * desired_speed)], dtype=float),
+            ]
+        )
         values = np.asarray(seeds, dtype=float)
         values = np.clip(values, low[None, :], high[None, :])
-        return self._dedupe_rows(values)
+        return self._dedupe_rows(values)[: max(int(self.config.max_initial_anchors), 1)]
 
     @staticmethod
     def _pairwise_collision_batch(
@@ -629,7 +632,7 @@ class GameParametricPlanner(Planner):
         ego_s = ego_s[:n, :m]
         ego_l = ego_l[:n, :m]
         target_front = target_s + float(cfg.vehicle_front)
-        ego_rear = ego_s - float(getattr(self.ego_cost_function.config, "ego_rear", cfg.vehicle_rear))
+        ego_rear = ego_s - float(self.ego_cost_function.config.ego_rear)
         gap = ego_rear - target_front
         desired_gap = float(cfg.min_follow_gap) + np.maximum(target_s_v, 0.0) * float(cfg.time_headway)
         lateral_gate = max(float(cfg.vehicle_width), 1e-3)
@@ -674,10 +677,14 @@ class GameParametricPlanner(Planner):
         exogenous_actors: Sequence[ActorPrediction],
     ) -> PlanningProblem:
         metadata = dict(actor.metadata or {})
-        s = float(metadata.get("s", 0.0))
-        l = float(metadata.get("l", dict(problem.metadata or {}).get("target_lane_l", 0.0)))
-        s_v = float(metadata.get("s_v", 0.0))
-        s_a = float(metadata.get("s_a", 0.0))
+        required_state = ("s", "l", "s_v", "s_a")
+        missing = tuple(key for key in required_state if key not in metadata)
+        if missing:
+            raise ValueError(f"Game actor {actor.actor_id!r} is missing state metadata: {missing}")
+        s = float(metadata["s"])
+        l = float(metadata["l"])
+        s_v = float(metadata["s_v"])
+        s_a = float(metadata["s_a"])
         target_metadata = dict(problem.metadata or {})
         target_metadata.update(
             {
@@ -685,12 +692,15 @@ class GameParametricPlanner(Planner):
                 "target_speed": s_v,
                 "prior_speed": s_v,
                 "source_actor_id": actor.actor_id,
+                "route_id": metadata.get("route_id", actor.actor_id),
             }
         )
+        target_ref_path = metadata.get("ref_path", problem.ref_path)
+        target_road_boundary = metadata.get("road_boundary", problem.road_boundary)
         return PlanningProblem(
             ego=EgoState(s=s, l=l, s_v=s_v, s_a=s_a),
-            ref_path=problem.ref_path,
-            road_boundary=problem.road_boundary,
+            ref_path=target_ref_path,
+            road_boundary=target_road_boundary,
             horizon=problem.horizon,
             dt=problem.dt,
             actors=tuple(exogenous_actors),
@@ -732,6 +742,7 @@ class GameParametricPlanner(Planner):
             length=float(template.length),
             width=float(template.width),
             metadata={
+                **dict(template.metadata or {}),
                 "s": float(s[0]) if s.size else 0.0,
                 "l": float(l[0]) if l.size else 0.0,
                 "s_v": float(np.asarray(s_v, dtype=float)[0]) if s_v is not None and np.asarray(s_v).size else 0.0,

@@ -7,8 +7,8 @@
 - 固定时域的时空联合轨迹规划。
 - 参数化轨迹优化，支持 CMA-ES 和 IGO-style game optimizer。
 - `lattice_trajectory`、`frenet_bezier_trajectory`、`frenet_bspline_trajectory`、`frenet_via_bspline_trajectory` 等轨迹模型。
-- `static_nudge`、`interactive_lane_change` 与 `dense_target_lane_change` 场景。
-- 双车博弈规划，用于联合生成自车和目标车辆轨迹，并进行近似 Nash/regret 收敛检查。
+- `static_nudge`、交互换道、稠密车流换道与无保护左转场景。
+- 多车 Bayesian 博弈规划，用于联合生成自车和多辆交互车辆轨迹，并进行近似 Nash/regret 收敛检查。
 - 分层 cost，包括碰撞、道路边界、动态约束、效率、参考线吸引和 trajectory-level certificate cost。
 - warm start 机制，用于提升采样优化的稳定性和收敛速度。
 
@@ -60,13 +60,14 @@ common              负责共享数据结构
 
 ## 博弈规划模块
 
-项目中已经加入一个 IGO 风格的双车博弈规划器，用于在交互换道场景中联合生成自车和目标车辆的未来轨迹。它不是简单把目标车辆当作固定预测障碍物，而是将目标车辆也建模为一个可优化的 player，在同一个固定 horizon 内与自车共同生成轨迹。
+项目中已经加入 IGO 风格的多车博弈规划器，用于联合生成自车和多辆交互车辆的未来轨迹。它不是简单把交互车辆当作固定预测障碍物，而是将每辆关键车辆都建模为拥有类型条件策略的物理 player，在同一个固定 horizon 内同步生成轨迹。
 
-当前实现面向两车博弈：
+三车无保护左转示例包含：
 
 ```text
-player 1: ego
-player 2: target_rear
+physical player 1: ego
+physical player 2: oncoming_vehicle
+physical player 3: left_crossing_vehicle
 ```
 
 默认博弈对象由配置指定：
@@ -74,9 +75,24 @@ player 2: target_rear
 ```yaml
 game:
   target_actor_id: target_lane_rear_vehicle
+  target_actor_ids: []
 ```
 
-在 `interactive_lane_change` 和 `dense_target_lane_change` 场景中，目标车道后车会作为博弈车辆参与优化，其他车辆仍作为外部障碍物处理。
+单交互车场景可继续使用 `target_actor_id`。多车场景可通过 `target_actor_ids` 显式配置，或者由场景通过 `PlanningProblem.metadata["game_actor_ids"]` 提供。
+
+### 多车 Bayesian 策略表示
+
+对两辆不确定交互车、每车三种行为类型，优化器维护一个共享自车策略和六个类型条件策略：
+
+```text
+ego
+oncoming_vehicle:yielding / oncoming_vehicle:normal / oncoming_vehicle:aggressive
+left_crossing_vehicle:yielding / left_crossing_vehicle:normal / left_crossing_vehicle:aggressive
+```
+
+评估器精确枚举 `3 x 3 = 9` 个联合类型假设。自车 cost 按联合 belief 概率进行期望与 CVaR 聚合；某个 `actor:type` 玩家则最小化在“自身类型已知为该类型”条件下，对其他车辆类型边缘化后的条件期望 cost。所有策略分布仍在同一个同步 Bayesian IGO Flow 中更新，不是为每个类型组合分别启动一场完整博弈。
+
+不同物理车辆可以拥有各自的参考路径。跨路径碰撞在 XY 时空中使用定向包围盒进行时间对齐，避免直接比较不同 Frenet 坐标系里的 `s/l`。
 
 ### Player 与轨迹模型
 
@@ -188,28 +204,44 @@ evidence = [s_error, v_error, a_error, delta_s_error, delta_v_error]
 
 ### IGO Game Optimizer
 
-博弈优化器是：
+普通确定性博弈使用：
 
 ```python
 GameIGOOptimizer
 ```
 
-它使用和 CMA-ES 类似的分布式采样更新方式，但不是只优化一个 agent 的 cost，而是为每个 player 维护自己的采样分布：
+意图不确定性博弈使用：
 
-```text
-ego distribution
-target_rear distribution
+```python
+BayesianIGOOptimizer
 ```
 
-每轮迭代流程如下：
+`BayesianIGOOptimizer` 直接求解一般和 Bayesian 博弈，不会将各玩家 cost 加权成合作式总 cost，也不要求将问题转换成势博弈。它为自车共享策略和各目标车类型条件策略分别维护 IGO/CMA 分布：
 
-1. 从每个 player 的分布中采样候选参数。
-2. 将各 player 参数配对，形成 joint samples。
-3. 批量 decode 成联合轨迹。
-4. 分别计算 ego cost 和 target cost。
-5. 根据各自 cost 更新各自的采样分布。
-6. 从历史 joint candidates 中选择当前最优联合解。
-7. 执行 feasibility、joint stability 和 Nash/regret 收敛检查。
+```text
+ego shared distribution
+target_rear_yielding conditional distribution
+target_rear_normal conditional distribution
+target_rear_aggressive conditional distribution
+```
+
+这些分布属于同一个同步 Bayesian IGO Flow，而不是分别运行多场完整博弈。每轮迭代流程如下：
+
+1. 从所有策略分布中同时采样，形成一批类型条件联合策略。
+2. 每个 sample index 构成一组完整联合 Bayesian 策略 profile，并一次批量评估全部类型场景。
+3. 自车使用 belief 加权期望、CVaR 与隐式 contingency cost 更新共享分布。
+4. 每种目标车类型使用自己的条件 cost 更新对应分布。
+5. 每轮只进行一次联合 batch 评估，并同步更新所有玩家分布。
+6. 从每个分布的主导 component 组成当前 Bayesian 策略 profile。
+7. 当 Flow 与 profile 稳定时，固定其他玩家，在每个玩家当前解附近做少量随机扰动，近似检查局部 Bayesian regret。
+
+在线局部 Nash 检查只负责低成本早停判断，不会把扰动结果注入分布或代替 IGO 求解。只有所有重要类型满足：
+
+```text
+max_bayesian_regret <= game.equilibrium.regret_tol
+```
+
+才会将结果判定为近似 Bayesian-Nash 均衡并早停。
 
 这套优化是 general-sum game。自车和目标车各自拥有自己的 cost，并不要求共享同一个全局目标函数。
 
@@ -259,7 +291,7 @@ VehicleGameCost
 
 ### 联合解选择
 
-优化过程中会产生大量 joint candidates：
+优化器仅在最终一轮 joint samples 中选择联合解：
 
 ```text
 (ego_theta_i, target_theta_i)
@@ -271,7 +303,7 @@ VehicleGameCost
 ego prioritized + opponent rank gate
 ```
 
-也就是说，规划器优先选择 ego cost 较低的候选，但要求 target 的 cost rank 不能太差。如果找不到满足 target rank gate 的候选，则退化为综合 rank 更好的联合解。
+也就是说，规划器通过一个明确的 merit 统一排序：优先降低 ego cost rank，同时对超过 target rank gate 的部分施加强惩罚。选择过程不再在多个 fallback 策略之间切换。
 
 对应配置：
 
@@ -387,13 +419,28 @@ python -B -m spatiotemporal_joint_planner.demo \
   --show
 ```
 
-其中 `game.simulated_target_type` 仅用于仿真闭环中的隐藏真实类型；规划器决策时只能使用并逐帧更新 `yielding / normal / aggressive` 的类型信念。
+三车无保护左转 Bayesian 博弈：
+
+```bash
+python -B -m spatiotemporal_joint_planner.demo \
+  --scenario unprotected_left_turn \
+  --trajectory-model lattice_trajectory \
+  --set planner.type=bayesian_game \
+  --set optimizer.samples=8 \
+  --set optimizer.iterations=8 \
+  --show
+```
+
+<img src="docs/validation/unprotected_left_turn_three_vehicle_game.gif" width="560" alt="three vehicle unprotected left turn Bayesian game">
+
+其中 `game.simulated_target_type` 可为所有交互车设置默认隐藏真实类型；`game.simulated_actor_types` 可按 actor id 单独设置。规划器决策时只能使用并逐帧更新 `yielding / normal / aggressive` 的类型信念。
 
 ### 当前限制
 
 当前博弈模块仍然是原型实现，主要限制包括：
 
-- 当前只实现两车博弈：ego 与一个目标车辆。
+- 多车 Bayesian evaluator 当前精确枚举联合类型假设，复杂度会随物理交互车辆数量指数增长；`game.max_exact_hypotheses` 用于限制组合数。
+- 在线 Nash 检查采用当前解附近的有限随机扰动，适合逐帧早停，但不是全局最佳响应证明；高覆盖率独立 regret Oracle 仅用于离线验证。
 - 目标车当前只做纵向参数化，不做横向变道。
 - 目标车行为不是完整意图预测，而是在给定车道内优化 `[s_end, v_end]`。
 - Nash 检查是采样候选上的近似检查，不是解析 Nash 证明。
@@ -732,7 +779,6 @@ spatiotemporal_joint_planner/planner/warm_start/
 
 ```text
 lattice_trajectory
-svgd_particle_trajectory
 ```
 
 它会采样：
@@ -802,7 +848,21 @@ OptimizationResult
   history
 ```
 
-CMA-ES 会先评估 warm start anchors，再用 anchors 初始化多个 component，之后迭代采样、评估、排序、更新分布。
+CMA-ES 会先评估少量 warm start anchors，再用 anchors 初始化多个 component，之后迭代采样、评估、排序、更新分布。
+
+当前 warm start 与候选管理遵循以下规则：
+
+- 每种轨迹模型必须且只能匹配一个专用 `WarmStartGenerator`。
+- 默认最多保留 8 个有序语义 seed，不再生成大规模笛卡尔积后再截断。
+- warm start 只用于初始化优化分布，不再混入最终候选池。
+- CMA-ES 最终候选池只包含全局最优解与最终一轮样本。
+- Game IGO 最终候选池只包含最终一轮 joint samples。
+
+### 严格执行模式
+
+项目默认使用 `planner.objective_mode: vectorized`。该模式要求轨迹模型和 cost 完整支持 batch 接口；batch 执行失败时会直接抛出异常，不再静默回退到 scalar 实现。
+
+同样，缺失轨迹必需字段、畸形 temporal blocked range、无效行为类型、缺失参考线几何接口等输入都会明确报错。这样可以从日志和堆栈中确认实际执行路径，避免 fallback 掩盖配置或建模错误。
 
 ## Cost 模块
 

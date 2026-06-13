@@ -1,0 +1,204 @@
+{
+  "summary": {
+    "passed": true,
+    "checks": {
+      "scalar_batch_cost_consistency": true,
+      "belief_identification": true,
+      "continuation_properties": true,
+      "temporal_collision_alignment": true,
+      "flow_profile_bayesian_regret": true,
+      "online_independent_bayesian_regret": true,
+      "independent_ego_regret": true,
+      "independent_target_regret": true
+    },
+    "important_finding": "The synchronous Bayesian IGO flow profile passed the independent regret audit."
+  },
+  "cost_consistency": {
+    "lattice_trajectory": {
+      "model_name": "lattice_trajectory",
+      "sample_count": 128,
+      "max_absolute_error": 2.9567047022283077e-05,
+      "mean_absolute_error": 2.912302115021248e-07,
+      "max_relative_error": 9.25683103702355e-11,
+      "mean_relative_error": 7.250639734953229e-13,
+      "worst_index": 117,
+      "worst_parameters": [
+        -4.000169874844506,
+        0.8871840762511272
+      ],
+      "worst_scalar_cost": 319407.8719167169,
+      "worst_batch_cost": 319407.87194628397,
+      "passed": true
+    },
+    "frenet_bspline_trajectory": {
+      "model_name": "frenet_bspline_trajectory",
+      "sample_count": 128,
+      "max_absolute_error": 5.960464477539062e-07,
+      "mean_absolute_error": 2.9266633561064737e-08,
+      "max_relative_error": 1.8076550431263224e-13,
+      "mean_relative_error": 1.4711525527433728e-15,
+      "worst_index": 102,
+      "worst_parameters": [
+        -2.5918278628596636,
+        -2.321488939595382,
+        0.9834189091130756
+      ],
+      "worst_scalar_cost": 527446.5885446972,
+      "worst_batch_cost": 527446.5885446018,
+      "passed": true
+    },
+    "frenet_bezier_trajectory": {
+      "model_name": "frenet_bezier_trajectory",
+      "sample_count": 128,
+      "max_absolute_error": 2.2649765014648438e-06,
+      "mean_absolute_error": 3.605964860042832e-08,
+      "max_relative_error": 2.3998514498046968e-14,
+      "mean_relative_error": 2.373036470776989e-16,
+      "worst_index": 10,
+      "worst_parameters": [
+        -1.820322669942223,
+        -3.4411530068223506,
+        0.671013370366335
+      ],
+      "worst_scalar_cost": 8537652.046424773,
+      "worst_batch_cost": 8537652.046424568,
+      "passed": true
+    },
+    "frenet_via_bspline_trajectory": {
+      "model_name": "frenet_via_bspline_trajectory",
+      "sample_count": 128,
+      "max_absolute_error": 3.337860107421875e-06,
+      "mean_absolute_error": 3.53902587235666e-08,
+      "max_relative_error": 4.866391745921317e-15,
+      "mean_relative_error": 5.469175662137366e-17,
+      "worst_index": 95,
+      "worst_parameters": [
+        1.4414102930527373,
+        -3.0002197061765217,
+        -1.150164459972772,
+        1.4627741682975453
+      ],
+      "worst_scalar_cost": 685900412.8098494,
+      "worst_batch_cost": 685900412.8098527,
+      "passed": true
+    }
+  },
+  "belief_filter": {
+    "yielding": {
+      "true_type_probability": 0.9568666666666668,
+      "probabilities": {
+        "yielding": 0.9568666666666668,
+        "normal": 0.02156666666666667,
+        "aggressive": 0.02156666666666667
+      }
+    },
+    "normal": {
+      "true_type_probability": 0.9568666666666668,
+      "probabilities": {
+        "yielding": 0.02156666666666667,
+        "normal": 0.9568666666666668,
+        "aggressive": 0.02156666666666667
+      }
+    },
+    "aggressive": {
+      "true_type_probability": 0.9568666666666666,
+      "probabilities": {
+        "yielding": 0.021566666666666668,
+        "normal": 0.021566666666666668,
+        "aggressive": 0.9568666666666666
+      }
+    }
+  },
+  "implicit_contingency": {
+    "passed": true,
+    "separable_different_cost_score": 0.0,
+    "indistinguishable_different_cost_score": 0.03100904354626033,
+    "indistinguishable_same_cost_score": 0.0,
+    "separability_monotonic_scores": [
+      0.03100904354626033,
+      0.03100904354626033,
+      0.030408772889080393,
+      4.6955643950852277e-07
+    ]
+  },
+  "temporal_collision": {
+    "passed": true,
+    "different_times_overlap": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "same_time_overlap": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "final_sample_overlap": [
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "bayesian_game_regret": {
+    "planner_status": "success",
+    "plan_time_ms": 786.9093999997858,
+    "oracle_time_ms": 529.1104999996605,
+    "flow_profile_max_bayesian_regret": 0.04887763457363063,
+    "flow_profile_ego_bayesian_regret": 1.537469684389655e-10,
+    "online_independent_max_bayesian_regret": 0.04887763457363063,
+    "online_independent_equilibrium_converged": 1.0,
+    "online_independent_check_count": 1,
+    "best_response_feedback_count": 0,
+    "internal_stop_reason": "early_stop:independent_bayesian_equilibrium_verified",
+    "oracle": {
+      "ego": {
+        "player_name": "ego",
+        "current_cost": 543.751759150728,
+        "best_response_cost": 543.7517590671279,
+        "normalized_regret": 1.537469684389655e-10,
+        "best_response_parameters": [
+          1.4499999999999997,
+          -0.12213916685379722,
+          15.0
+        ],
+        "candidate_count": 1183
+      },
+      "targets_by_type": {
+        "yielding": {
+          "player_name": "target_rear_yielding",
+          "current_cost": 6606.837481959853,
+          "best_response_cost": 6520.093467091853,
+          "normalized_regret": 0.013129430700370133,
+          "best_response_parameters": [
+            25.0,
+            14.638732244906384
+          ],
+          "candidate_count": 1098
+        },
+        "normal": {
+          "player_name": "target_rear_normal",
+          "current_cost": 2290.6401134464695,
+          "best_response_cost": 2202.66528554221,
+          "normalized_regret": 0.03840621989802396,
+          "best_response_parameters": [
+            25.0,
+            14.89609212243854
+          ],
+          "candidate_count": 1098
+        },
+        "aggressive": {
+          "player_name": "target_rear_aggressive",
+          "current_cost": 358.2880237411521,
+          "best_response_cost": 358.2880237411521,
+          "normalized_regret": 0.0,
+          "best_response_parameters": [
+            43.31505111130585,
+            14.165746514022386
+          ],
+          "candidate_count": 1098
+        }
+      },
+      "max_regret": 0.03840621989802396
+    }
+  }
+}

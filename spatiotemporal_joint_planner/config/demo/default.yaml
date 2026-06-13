@@ -32,7 +32,6 @@ optimizer:
   theta_window_tol: 0.02
   component_sigma_tol: 0.08
   component_weight_tol: 0.15
-  max_anchor_samples: 128
   opponent_rank_gate: 0.35
   nash_check: true
   nash_regret_tol: 0.02
@@ -63,28 +62,33 @@ cost:
 
 planner:
   type: parametric
-  max_initial_anchors: 96
+  max_initial_anchors: 8
   mode_paths: 8
-  objective_mode: auto
+  objective_mode: vectorized
   warm_start: true
 
 game:
   target_actor_id: target_lane_rear_vehicle
+  target_actor_ids: []
   target_min_terminal_speed: 0.0
   target_max_terminal_speed: 15.0
   target_min_terminal_s_offset: -10.0
   target_max_terminal_s_offset: 25.0
   simulated_target_type: normal
+  simulated_actor_types: {}
   min_type_probability_for_feasibility: 0.05
+  max_exact_hypotheses: 81
   risk:
     expected_weight: 1.0
     cvar_weight: 0.35
     cvar_alpha: 0.25
   equilibrium:
     check_interval: 3
-    regret_tol: 0.08
+    regret_tol: 0.1
     material_type_probability: 0.05
-    polish_rounds: 2
+    local_nash_samples: 16
+    local_nash_perturbation: 0.05
+    local_nash_seed: 1701
   continuation:
     enabled: true
     observation_time: 0.8

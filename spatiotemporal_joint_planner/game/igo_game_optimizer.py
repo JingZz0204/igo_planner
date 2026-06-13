@@ -30,7 +30,6 @@ class GameIGOConfig:
     theta_window_tol: float = 2e-2
     component_sigma_tol: float = 0.08
     component_weight_tol: float = 0.15
-    max_anchor_samples: int = 192
     opponent_rank_gate: float = 0.35
     nash_check: bool = True
     nash_regret_tol: float = 0.02
@@ -61,14 +60,13 @@ class GameIGOOptimizer:
     def __init__(self, config: Optional[GameIGOConfig] = None):
         self.config = config or GameIGOConfig()
         self._rng = np.random.default_rng(self.config.seed)
-        self._last_positions: dict[str, np.ndarray] = {}
 
     @property
     def name(self) -> str:
         return "igo_game"
 
     def reset(self) -> None:
-        self._last_positions.clear()
+        self._rng = np.random.default_rng(self.config.seed)
 
     def optimize(self, problem: GameOptimizationProblem) -> GameOptimizationResult:
         if not problem.players:
@@ -89,8 +87,8 @@ class GameIGOOptimizer:
         }
 
         history: list[dict] = []
-        all_positions = {name: [] for name in player_names}
-        all_values = {name: [] for name in player_names}
+        final_positions = {name: np.empty((0, bounds[name][0].size), dtype=float) for name in player_names}
+        final_values = {name: np.empty((0,), dtype=float) for name in player_names}
         best_parameters: Optional[dict[str, np.ndarray]] = None
         best_joint: Optional[JointTrajectory] = None
         best_costs = None
@@ -101,24 +99,6 @@ class GameIGOOptimizer:
         selected_cost_history: list[np.ndarray] = []
         stop_reason = "max_iterations"
         stop_diagnostics: dict[str, float] = {}
-        anchors_by_player = {
-            player.name: self._clip_positions_to_bounds(
-                self._as_anchor_matrix(player.initial_population),
-                bounds[player.name],
-            )
-            for player in problem.players
-        }
-        anchor_samples = self._initial_joint_samples(problem, anchors_by_player, bounds)
-        if anchor_samples:
-            joint_results = self._evaluate_joint_samples(problem, anchor_samples)
-            values = joint_results["values"]
-            for name in player_names:
-                all_positions[name].append(np.asarray(anchor_samples[name], dtype=float))
-                all_values[name].append(np.asarray(values[name], dtype=float))
-            best_parameters, best_selection = self._select_global_joint_candidate(all_positions, all_values, player_names)
-            best_joint = None
-            best_costs = None
-
         for iteration in range(max(int(self.config.n_iterations), 0)):
             unit_samples = {}
             component_ids = {}
@@ -132,8 +112,8 @@ class GameIGOOptimizer:
             joint_results = self._evaluate_joint_samples(problem, parameter_samples)
             values = joint_results["values"]
             for name in player_names:
-                all_positions[name].append(np.asarray(parameter_samples[name], dtype=float))
-                all_values[name].append(np.asarray(values[name], dtype=float))
+                final_positions[name] = np.asarray(parameter_samples[name], dtype=float)
+                final_values[name] = np.asarray(values[name], dtype=float)
                 best_idx = int(np.argmin(values[name]))
                 best_value_history[name].append(float(values[name][best_idx]))
                 best_unit_history[name].append(np.asarray(unit_samples[name][best_idx], dtype=float).copy())
@@ -144,7 +124,11 @@ class GameIGOOptimizer:
                     values[name],
                     iteration,
                 )
-            best_parameters, best_selection = self._select_global_joint_candidate(all_positions, all_values, player_names)
+            best_parameters, best_selection = self._select_joint_candidate(
+                final_positions,
+                final_values,
+                player_names,
+            )
             best_joint = None
             best_costs = None
 
@@ -166,7 +150,6 @@ class GameIGOOptimizer:
                             selected_parameters=best_parameters,
                             current_samples=parameter_samples.get(name),
                             current_values=values.get(name),
-                            anchors=anchors_by_player.get(name),
                             state=states[name],
                             bounds=bounds[name],
                         )
@@ -216,15 +199,6 @@ class GameIGOOptimizer:
             best_joint = problem.decode_joint(best_parameters)
             best_costs = dict(problem.evaluate_joint(best_joint))
 
-        self._last_positions = {name: value.copy() for name, value in best_parameters.items()}
-        player_populations = {
-            name: np.vstack(chunks) if chunks else np.empty((0, bounds[name][0].size), dtype=float)
-            for name, chunks in all_positions.items()
-        }
-        player_values = {
-            name: np.concatenate(chunks) if chunks else np.empty((0,), dtype=float)
-            for name, chunks in all_values.items()
-        }
         return GameOptimizationResult(
             best_parameters=best_parameters,
             best_joint_trajectory=best_joint,
@@ -240,9 +214,8 @@ class GameIGOOptimizer:
                 "stop_reason": stop_reason,
                 "early_stop": bool(self.config.early_stop),
                 "player_names": tuple(player_names),
-                "joint_selection": "ego_prioritized_opponent_rank_gate",
+                "joint_selection": "ego_rank_with_opponent_gate_penalty",
                 "opponent_rank_gate": float(self.config.opponent_rank_gate),
-                "max_anchor_samples": int(self.config.max_anchor_samples),
                 "nash_check": bool(self.config.nash_check),
                 "nash_regret_tol": float(self.config.nash_regret_tol),
                 "nash_candidate_limit": int(self.config.nash_candidate_limit),
@@ -252,109 +225,26 @@ class GameIGOOptimizer:
                 **best_selection,
                 **stop_diagnostics,
             },
-            player_populations=player_populations,
-            player_values=player_values,
+            player_populations=final_positions,
+            player_values=final_values,
             joint_merit=None,
         )
 
     def _evaluate_joint_samples(self, problem: GameOptimizationProblem, samples: Mapping[str, np.ndarray]) -> dict:
         player_names = list(samples.keys())
         sample_count = min(np.asarray(samples[name]).shape[0] for name in player_names)
-        if problem.evaluate_joint_batch is not None:
-            try:
-                raw_values = problem.evaluate_joint_batch(samples)
-                values = {}
-                for name in player_names:
-                    value = np.asarray(raw_values[name], dtype=float).reshape(-1)
-                    if value.shape != (sample_count,):
-                        raise ValueError(f"Batch value shape mismatch for {name}: {value.shape} != {(sample_count,)}")
-                    value = value.copy()
-                    value[~np.isfinite(value)] = float("inf")
-                    values[name] = value
-                return {"values": values}
-            except Exception:
-                pass
-        values = {name: np.full((sample_count,), float("inf"), dtype=float) for name in player_names}
-        trajectories = []
-        costs = []
-        for idx in range(sample_count):
-            parameters = {name: np.asarray(samples[name][idx], dtype=float) for name in player_names}
-            try:
-                joint = problem.decode_joint(parameters)
-                result_costs = dict(problem.evaluate_joint(joint))
-            except Exception:
-                joint = JointTrajectory(trajectories={})
-                result_costs = {}
-            trajectories.append(joint)
-            costs.append(result_costs)
-            for name in player_names:
-                cost = result_costs.get(name)
-                value = float("inf") if cost is None else float(cost.total)
-                values[name][idx] = value if np.isfinite(value) else float("inf")
-        return {"values": values, "trajectories": trajectories, "costs": costs}
-
-    def _initial_joint_samples(
-        self,
-        problem: GameOptimizationProblem,
-        anchors_by_player: Mapping[str, np.ndarray],
-        bounds: Mapping[str, tuple[np.ndarray, np.ndarray]],
-    ) -> dict[str, np.ndarray]:
-        player_names = [player.name for player in problem.players]
-        if not player_names:
-            return {}
-
-        references = {}
-        for player in problem.players:
-            try:
-                reference = player.trajectory_model.reference_parameters(player.problem)
-            except Exception:
-                reference = 0.5 * (bounds[player.name][0] + bounds[player.name][1])
-            references[player.name] = np.clip(np.asarray(reference, dtype=float), bounds[player.name][0], bounds[player.name][1])
-
-        max_samples = max(int(self.config.max_anchor_samples), 0)
-        rows: list[dict[str, np.ndarray]] = []
-        seen = set()
-
-        def add_row(row: Mapping[str, np.ndarray]) -> None:
-            if len(rows) >= max_samples:
-                return
-            clipped = {}
-            key_values = []
-            for name in player_names:
-                low, high = bounds[name]
-                value = np.clip(np.asarray(row[name], dtype=float), low, high)
-                clipped[name] = value
-                key_values.extend(np.round(value, 8).tolist())
-            key = tuple(key_values)
-            if key in seen:
-                return
-            seen.add(key)
-            rows.append(clipped)
-
-        add_row(references)
+        if problem.evaluate_joint_batch is None:
+            raise ValueError("Game IGO requires evaluate_joint_batch; scalar fallback is disabled.")
+        raw_values = problem.evaluate_joint_batch(samples)
+        values = {}
         for name in player_names:
-            anchors = anchors_by_player.get(name, np.empty((0, bounds[name][0].size), dtype=float))
-            for anchor in anchors:
-                row = {other_name: references[other_name] for other_name in player_names}
-                row[name] = np.asarray(anchor, dtype=float)
-                add_row(row)
-
-        max_anchor_count = max((anchors.shape[0] for anchors in anchors_by_player.values() if anchors.size), default=0)
-        for idx in range(max_anchor_count):
-            add_row(
-                {
-                    name: (
-                        anchors_by_player[name][idx % anchors_by_player[name].shape[0]]
-                        if anchors_by_player[name].size
-                        else references[name]
-                    )
-                    for name in player_names
-                }
-            )
-
-        if not rows:
-            add_row(references)
-        return {name: np.asarray([row[name] for row in rows], dtype=float) for name in player_names}
+            value = np.asarray(raw_values[name], dtype=float).reshape(-1)
+            if value.shape != (sample_count,):
+                raise ValueError(f"Batch value shape mismatch for {name}: {value.shape} != {(sample_count,)}")
+            if not np.all(np.isfinite(value)):
+                raise FloatingPointError(f"Game IGO batch evaluator produced non-finite values for player {name!r}.")
+            values[name] = value
+        return {"values": values}
 
     def _initial_state(
         self,
@@ -365,8 +255,6 @@ class GameIGOOptimizer:
         dim = int(bounds[0].size)
         n_components = max(int(self.config.n_components), 1)
         means = []
-        if player_name in self._last_positions and self._last_positions[player_name].shape == (dim,):
-            means.append(np.clip(normalize_parameters(self._last_positions[player_name], bounds), 0.0, 1.0))
         for anchor in anchors:
             if anchor.shape == (dim,):
                 means.append(np.clip(normalize_parameters(anchor, bounds), 0.0, 1.0))
@@ -657,11 +545,8 @@ class GameIGOOptimizer:
     ) -> dict[str, float]:
         diagnostics = {}
         feasible_flags = []
-        try:
-            joint = problem.decode_joint(selected_parameters)
-            costs = dict(problem.evaluate_joint(joint))
-        except Exception:
-            costs = {}
+        joint = problem.decode_joint(selected_parameters)
+        costs = dict(problem.evaluate_joint(joint))
         for name in player_names:
             cost = costs.get(name)
             feasible = bool(cost.feasible) if cost is not None else False
@@ -797,7 +682,6 @@ class GameIGOOptimizer:
         selected_parameters: Mapping[str, np.ndarray],
         current_samples: Optional[np.ndarray],
         current_values: Optional[np.ndarray],
-        anchors: Optional[np.ndarray],
         state: _DistributionState,
         bounds: tuple[np.ndarray, np.ndarray],
     ) -> np.ndarray:
@@ -820,13 +704,6 @@ class GameIGOOptimizer:
         current = self._ranked_rows(current_samples, current_values)
         if current.size:
             rows.extend(current)
-
-        anchor_values = self._clip_positions_to_bounds(
-            np.empty((0, low.size), dtype=float) if anchors is None else np.asarray(anchors, dtype=float),
-            bounds,
-        )
-        if anchor_values.size:
-            rows.extend(anchor_values)
 
         matrix = self._dedupe_rows(np.asarray(rows, dtype=float), bounds)
         limit = max(int(self.config.nash_candidate_limit), 1)
@@ -904,20 +781,12 @@ class GameIGOOptimizer:
             merit += ranks
         return merit / max(float(len(player_names)), 1.0)
 
-    def _select_global_joint_candidate(
+    def _select_joint_candidate(
         self,
-        all_positions: Mapping[str, list[np.ndarray]],
-        all_values: Mapping[str, list[np.ndarray]],
+        positions: Mapping[str, np.ndarray],
+        values: Mapping[str, np.ndarray],
         player_names: list[str],
     ) -> tuple[dict[str, np.ndarray], dict]:
-        positions = {
-            name: np.vstack(all_positions[name]) if all_positions.get(name) else np.empty((0, 0), dtype=float)
-            for name in player_names
-        }
-        values = {
-            name: np.concatenate(all_values[name]) if all_values.get(name) else np.empty((0,), dtype=float)
-            for name in player_names
-        }
         sample_count = min((values[name].size for name in player_names), default=0)
         if sample_count <= 0:
             raise RuntimeError("No evaluated game samples are available for selection.")
@@ -925,40 +794,28 @@ class GameIGOOptimizer:
         for name in player_names:
             finite &= np.isfinite(values[name][:sample_count])
         if not np.any(finite):
-            idx = 0
-            return {name: positions[name][idx].copy() for name in player_names}, {
-                "selection_index": int(idx),
-                "selection_mode": "fallback_first_no_finite",
-                "selection_merit": float("inf"),
-            }
+            raise RuntimeError("No finite game samples are available for joint selection.")
 
         ranks = {name: self._normalized_ranks(values[name][:sample_count]) for name in player_names}
         ego_name = player_names[0]
         opponent_names = player_names[1:]
-        candidate_mask = finite.copy()
+        gate_violation = np.zeros((sample_count,), dtype=float)
         for name in opponent_names:
-            candidate_mask &= ranks[name] <= float(self.config.opponent_rank_gate)
-
-        if np.any(candidate_mask):
-            candidate_indices = np.where(candidate_mask)[0]
-            ego_values = values[ego_name][candidate_indices]
-            ego_ranks = ranks[ego_name][candidate_indices]
-            tie_break = np.sum(np.vstack([ranks[name][candidate_indices] for name in player_names]), axis=0)
-            order = np.lexsort((tie_break, ego_ranks, ego_values))
-            idx = int(candidate_indices[order[0]])
-            mode = "ego_min_with_opponent_rank_gate"
-        else:
-            candidate_indices = np.where(finite)[0]
-            merit = np.sum(np.vstack([ranks[name][candidate_indices] for name in player_names]), axis=0)
-            order = np.lexsort((values[ego_name][candidate_indices], merit))
-            idx = int(candidate_indices[order[0]])
-            mode = "fallback_min_sum_rank"
-
-        selection_merit = float(np.sum([ranks[name][idx] for name in player_names]) / max(len(player_names), 1))
+            gate_violation += np.maximum(ranks[name] - float(self.config.opponent_rank_gate), 0.0)
+        opponent_rank_sum = (
+            np.sum(np.vstack([ranks[name] for name in opponent_names]), axis=0)
+            if opponent_names
+            else np.zeros((sample_count,), dtype=float)
+        )
+        merit = ranks[ego_name] + 10.0 * gate_violation + 0.1 * opponent_rank_sum
+        merit = np.where(finite, merit, np.inf)
+        idx = int(np.argmin(merit))
+        selection_merit = float(merit[idx])
         diagnostics = {
             "selection_index": int(idx),
-            "selection_mode": mode,
+            "selection_mode": "ego_rank_with_opponent_gate_penalty",
             "selection_merit": selection_merit,
+            "selection_gate_violation": float(gate_violation[idx]),
             "selection_ego_value": float(values[ego_name][idx]),
             "selection_ego_rank": float(ranks[ego_name][idx]),
         }

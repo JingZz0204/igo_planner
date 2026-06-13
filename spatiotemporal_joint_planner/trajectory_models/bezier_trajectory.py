@@ -228,13 +228,13 @@ class BezierTrajectoryModel(TrajectoryModel):
     def _start_pose(self, problem: PlanningProblem) -> tuple[float, float, float]:
         ref_path = problem.ref_path
         if not hasattr(ref_path, "calc_position") or not hasattr(ref_path, "calc_yaw"):
-            return float(problem.ego.s), float(problem.ego.l), float(problem.ego.yaw or 0.0)
+            raise TypeError("Bezier trajectory requires a geometric reference path.")
 
         route_end = self._route_end_s(ref_path)
         s0 = float(np.clip(problem.ego.s, 0.0, route_end))
         xy_ref = ref_path.calc_position(s0)
         if xy_ref is None or xy_ref[0] is None or xy_ref[1] is None:
-            return float(problem.ego.s), float(problem.ego.l), float(problem.ego.yaw or 0.0)
+            raise ValueError(f"Reference path returned no start position at s={s0:.3f}.")
 
         yaw_ref = float(ref_path.calc_yaw(s0))
         x0 = float(xy_ref[0]) + float(problem.ego.l) * math.cos(yaw_ref + math.pi / 2.0)
@@ -351,13 +351,13 @@ class BezierTrajectoryModel(TrajectoryModel):
         x_values = np.asarray(x_values, dtype=float)
         y_values = np.asarray(y_values, dtype=float)
         if not hasattr(ref_path, "calc_position") or not hasattr(ref_path, "calc_yaw"):
-            return x_values.copy(), y_values.copy()
+            raise TypeError("Bezier XY-to-SL projection requires a geometric reference path.")
 
         route_end = cls._route_end_s(ref_path)
         ds = max(float(projection_ds), 0.05)
         ref_s = np.arange(0.0, route_end + 0.5 * ds, ds, dtype=float)
         if ref_s.size == 0:
-            return x_values.copy(), y_values.copy()
+            raise ValueError("Reference path produced no projection samples.")
 
         ref_xy = []
         ref_yaw = []
@@ -370,7 +370,7 @@ class BezierTrajectoryModel(TrajectoryModel):
             ref_yaw.append(float(ref_path.calc_yaw(float(s_query))))
             valid_s.append(float(s_query))
         if not ref_xy:
-            return x_values.copy(), y_values.copy()
+            raise ValueError("Reference path returned no valid positions for Bezier projection.")
 
         ref_xy = np.asarray(ref_xy, dtype=float)
         ref_yaw = np.asarray(ref_yaw, dtype=float)
@@ -412,8 +412,9 @@ class BezierTrajectoryModel(TrajectoryModel):
 
     @staticmethod
     def _route_end_s(ref_path) -> float:
-        if hasattr(ref_path, "s"):
-            values = np.asarray(ref_path.s, dtype=float)
-            if values.size:
-                return max(float(values[-1]), 1e-3)
-        return 1.0e6
+        if not hasattr(ref_path, "s"):
+            raise TypeError("Reference path must expose cumulative arc-length samples through .s.")
+        values = np.asarray(ref_path.s, dtype=float)
+        if not values.size:
+            raise ValueError("Reference path .s must not be empty.")
+        return max(float(values[-1]), 1e-3)

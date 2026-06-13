@@ -31,7 +31,7 @@ class TerminalStateWarmStartConfig:
 class TerminalStateWarmStartGenerator(WarmStartGenerator):
     """Warm starts for theta = [l_end, v_end] terminal-state models."""
 
-    terminal_model_names = {"lattice_trajectory", "svgd_particle_trajectory"}
+    terminal_model_names = {"lattice_trajectory"}
 
     def __init__(self, config: Optional[TerminalStateWarmStartConfig] = None):
         self.config = config or TerminalStateWarmStartConfig()
@@ -48,32 +48,32 @@ class TerminalStateWarmStartGenerator(WarmStartGenerator):
         if context.previous_parameters is not None:
             rows.append(np.asarray(context.previous_parameters, dtype=float))
 
-        rows.extend(self._grid_rows(context))
+        rows.append(context.trajectory_model.reference_parameters(context.problem))
         rows.extend(self._obstacle_aware_rows(context))
         rows.extend(self._lane_rows(context))
-
-        try:
-            rows.append(context.trajectory_model.reference_parameters(context.problem))
-        except Exception:
-            pass
-        rows.append(0.5 * (context.lower_bound + context.upper_bound))
+        rows.extend(self._grid_rows(context))
         return finalize_warm_starts(rows, context)
 
     def _grid_rows(self, context: WarmStartContext) -> list[np.ndarray]:
         safe_right, safe_left = self._safe_lateral_bounds(context)
-        lateral_count = max(int(self.config.lateral_grid_count), 2)
-        speed_count = max(int(self.config.speed_grid_count), 2)
-        lateral_values = np.linspace(safe_right, safe_left, num=lateral_count, dtype=float)
-        speed_values = self._grid_speed_values(context, speed_count)
-
-        rows = []
+        lateral_values = np.linspace(
+            safe_right,
+            safe_left,
+            num=max(min(int(self.config.lateral_grid_count), int(context.max_count)), 2),
+            dtype=float,
+        )
+        speed_values = self._grid_speed_values(
+            context,
+            max(min(int(self.config.speed_grid_count), int(context.max_count)), 2),
+        )
         current_l = float(context.problem.ego.l)
         lateral_values = sorted(lateral_values.tolist(), key=lambda value: abs(float(value) - current_l))
         speed_values = sorted(speed_values, key=lambda value: abs(float(value) - float(context.problem.ego.s_v)))
-        for lateral in lateral_values:
-            for speed in speed_values:
-                rows.append(np.array([float(lateral), float(speed)], dtype=float))
-        return rows
+        count = min(len(lateral_values), len(speed_values), max(int(context.max_count), 1))
+        return [
+            np.array([float(lateral_values[index]), float(speed_values[index])], dtype=float)
+            for index in range(count)
+        ]
 
     def _grid_speed_values(self, context: WarmStartContext, count: int) -> list[float]:
         current_speed = max(float(context.problem.ego.s_v), 0.0)
@@ -203,8 +203,8 @@ class TerminalStateWarmStartGenerator(WarmStartGenerator):
             return []
         try:
             return [float(value) for value in lane_centers]
-        except (TypeError, ValueError):
-            return []
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid lane_centers metadata: {lane_centers!r}") from exc
 
     def _target_speed(self, context: WarmStartContext) -> float:
         metadata = dict(context.problem.metadata or {})
@@ -212,8 +212,8 @@ class TerminalStateWarmStartGenerator(WarmStartGenerator):
             if key in metadata:
                 try:
                     return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return float(self.config.max_terminal_speed)
 
     def _clip_speeds(self, speeds: Sequence[float]) -> list[float]:
@@ -223,35 +223,50 @@ class TerminalStateWarmStartGenerator(WarmStartGenerator):
 
     def _blocked_ranges(self, actors: Sequence[ActorPrediction]) -> list[dict]:
         ranges = []
+        keys = ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")
         for actor in actors:
             metadata = dict(actor.metadata or {})
-            if all(key in metadata for key in ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")):
-                ranges.append(
-                    self._inflate_blocked_range(
-                        {
-                            "s_min": float(metadata["blocked_s_min"]),
-                            "s_max": float(metadata["blocked_s_max"]),
-                            "l_min": float(metadata["blocked_l_min"]),
-                            "l_max": float(metadata["blocked_l_max"]),
-                            "actor_id": actor.actor_id,
-                        }
-                    )
-                )
+            if any(key in metadata for key in keys) and not all(key in metadata for key in keys):
+                missing = [key for key in keys if key not in metadata]
+                raise ValueError(f"Actor {actor.actor_id!r} warm-start blocked range is missing fields: {missing}.")
+            if all(key in metadata for key in keys):
+                blocked = {
+                    "s_min": float(metadata["blocked_s_min"]),
+                    "s_max": float(metadata["blocked_s_max"]),
+                    "l_min": float(metadata["blocked_l_min"]),
+                    "l_max": float(metadata["blocked_l_max"]),
+                    "actor_id": actor.actor_id,
+                }
+            elif ("s" in metadata) != ("l" in metadata):
+                raise ValueError(f"Actor {actor.actor_id!r} warm-start metadata must provide both s and l.")
             elif "s" in metadata and "l" in metadata:
                 half_length = 0.5 * float(actor.length)
                 half_width = 0.5 * float(actor.width)
-                ranges.append(
-                    self._inflate_blocked_range(
-                        {
-                            "s_min": float(metadata["s"]) - half_length,
-                            "s_max": float(metadata["s"]) + half_length,
-                            "l_min": float(metadata["l"]) - half_width,
-                            "l_max": float(metadata["l"]) + half_width,
-                            "actor_id": actor.actor_id,
-                        }
-                    )
+                blocked = {
+                    "s_min": float(metadata["s"]) - half_length,
+                    "s_max": float(metadata["s"]) + half_length,
+                    "l_min": float(metadata["l"]) - half_width,
+                    "l_max": float(metadata["l"]) + half_width,
+                    "actor_id": actor.actor_id,
+                }
+            else:
+                raise ValueError(
+                    f"Actor {actor.actor_id!r} must provide blocked_s/l bounds or an s/l pose for warm start."
                 )
+            self._validate_blocked_range(blocked)
+            ranges.append(self._inflate_blocked_range(blocked))
         return ranges
+
+    @staticmethod
+    def _validate_blocked_range(blocked: dict) -> None:
+        values = np.asarray(
+            [blocked["s_min"], blocked["s_max"], blocked["l_min"], blocked["l_max"]],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Actor {blocked['actor_id']!r} warm-start blocked range must be finite.")
+        if float(blocked["s_min"]) > float(blocked["s_max"]) or float(blocked["l_min"]) > float(blocked["l_max"]):
+            raise ValueError(f"Actor {blocked['actor_id']!r} warm-start blocked range has inverted bounds.")
 
     def _inflate_blocked_range(self, blocked: dict) -> dict:
         s_buffer = max(float(self.config.planning_obstacle_s_buffer), 0.0)
@@ -292,11 +307,4 @@ class SvgdParticleWarmStartGenerator(TerminalStateWarmStartGenerator):
         return context.trajectory_model.name == "svgd_particle_trajectory" and context.parameter_dim == 2
 
     def generate(self, context: WarmStartContext) -> np.ndarray:
-        rows = list(super().generate(context))
-        safe_right, safe_left = self._safe_lateral_bounds(context)
-        lateral_grid = np.linspace(safe_right, safe_left, num=7, dtype=float)
-        speed_grid = np.asarray(self._clip_speeds([0.5, 2.0, 4.0, 6.0, context.problem.ego.s_v, 12.0, 15.0]), dtype=float)
-        for lateral in lateral_grid:
-            for speed in speed_grid:
-                rows.append(np.array([float(lateral), float(speed)], dtype=float))
-        return finalize_warm_starts(rows, context)
+        return super().generate(context)

@@ -33,17 +33,26 @@ class FrenetBSplineWarmStartGenerator(WarmStartGenerator):
         rows = []
         if context.previous_parameters is not None:
             rows.append(np.asarray(context.previous_parameters, dtype=float))
-        try:
-            rows.append(context.trajectory_model.reference_parameters(context.problem))
-        except Exception:
-            pass
+        rows.append(context.trajectory_model.reference_parameters(context.problem))
 
         low = np.asarray(context.lower_bound, dtype=float)
         high = np.asarray(context.upper_bound, dtype=float)
         current_l = float(context.problem.ego.l)
         target_l = float(np.clip(self._target_l(context), low[1], high[1]))
         current_speed = max(float(context.problem.ego.s_v), 0.0)
-        target_speed = self._target_speed(context)
+        target_speed = float(np.clip(self._target_speed(context), low[2], high[2]))
+
+        rows.extend(
+            [
+                np.array([0.5 * (current_l + target_l), target_l, target_speed], dtype=float),
+                np.array([target_l, target_l, target_speed], dtype=float),
+                np.array([current_l, current_l, current_speed], dtype=float),
+                np.array([0.5 * (current_l + low[1]), low[1], target_speed], dtype=float),
+                np.array([0.5 * (current_l + high[1]), high[1], target_speed], dtype=float),
+            ]
+        )
+        if len(rows) >= int(context.max_count):
+            return finalize_warm_starts(rows, context)
 
         terminal_l_values = self._terminal_l_values(context, current_l, target_l, low[1], high[1])
         speed_values = self._speed_values(current_speed, target_speed, low[2], high[2])
@@ -62,8 +71,9 @@ class FrenetBSplineWarmStartGenerator(WarmStartGenerator):
             ):
                 for speed in speed_values:
                     rows.append(np.array([float(l_ctrl_mid), float(l_end), float(speed)], dtype=float))
+                    if len(rows) >= int(context.max_count):
+                        return finalize_warm_starts(rows, context)
 
-        rows.append(0.5 * (low + high))
         return finalize_warm_starts(rows, context)
 
     def _terminal_l_values(self, context: WarmStartContext, current_l: float, target_l: float, low: float, high: float) -> list[float]:
@@ -88,8 +98,8 @@ class FrenetBSplineWarmStartGenerator(WarmStartGenerator):
             if key in metadata:
                 try:
                     return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return float(context.problem.ego.l)
 
     @staticmethod
@@ -99,8 +109,8 @@ class FrenetBSplineWarmStartGenerator(WarmStartGenerator):
             if key in metadata:
                 try:
                     return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return float(context.problem.ego.s_v)
 
     @staticmethod
@@ -111,8 +121,8 @@ class FrenetBSplineWarmStartGenerator(WarmStartGenerator):
             return []
         try:
             return [float(value) for value in lane_centers]
-        except (TypeError, ValueError):
-            return []
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid lane_centers metadata: {lane_centers!r}") from exc
 
     @staticmethod
     def _ordered_unique(values: Sequence[float]) -> list[float]:

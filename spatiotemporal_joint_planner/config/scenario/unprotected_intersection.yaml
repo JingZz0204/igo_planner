@@ -1,0 +1,17 @@
+scenario:
+  type: unprotected_intersection
+  horizon: 5.0
+  dt: 0.1
+  route_extent: 55.0
+  lane_offset: 1.8
+  road_half_width: 4.2
+  ego_s: 18.0
+  ego_speed: 9.0
+  target_speed: 10.0
+  actors:
+    north:
+      s: 22.0
+      s_v: 7.5
+    south:
+      s: 15.0
+      s_v: 8.5

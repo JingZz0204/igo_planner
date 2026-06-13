@@ -58,10 +58,8 @@ class _MixtureState:
 class CMAESOptimizer(Optimizer):
     """Multi-modal CMA-ES optimizer in normalized parameter space."""
 
-    def __init__(self, config: Optional[CMAESConfig] = None, warm_start: bool = True):
+    def __init__(self, config: Optional[CMAESConfig] = None):
         self.config = config or CMAESConfig()
-        self.warm_start = bool(warm_start)
-        self._last_position: Optional[np.ndarray] = None
         self._rng = np.random.default_rng(self.config.seed)
 
     @property
@@ -74,8 +72,8 @@ class CMAESOptimizer(Optimizer):
 
         best_position = None
         best_value = float("inf")
-        all_positions = []
-        all_values = []
+        candidate_positions = np.empty((0, bounds[0].size), dtype=float)
+        candidate_values = np.empty((0,), dtype=float)
         history = []
         best_value_history = []
         best_unit_history = []
@@ -85,8 +83,6 @@ class CMAESOptimizer(Optimizer):
         anchor_positions = self._clip_positions_to_bounds(anchors, bounds)
         if anchor_positions.size:
             anchor_values = self._evaluate_many(problem, anchor_positions)
-            all_positions.append(anchor_positions)
-            all_values.append(anchor_values)
             anchor_best_idx = int(np.argmin(anchor_values))
             if float(anchor_values[anchor_best_idx]) < best_value:
                 best_value = float(anchor_values[anchor_best_idx])
@@ -99,8 +95,8 @@ class CMAESOptimizer(Optimizer):
             unit_samples, component_ids = self._sample_population(state)
             positions = denormalize_parameters(unit_samples, bounds)
             values = self._evaluate_many(problem, positions)
-            all_positions.append(positions)
-            all_values.append(values)
+            candidate_positions = positions
+            candidate_values = values
 
             iter_best_idx = int(np.argmin(values))
             iter_best_value = float(values[iter_best_idx])
@@ -133,11 +129,17 @@ class CMAESOptimizer(Optimizer):
         if best_position is None:
             raise RuntimeError("CMA-ES did not evaluate any samples.")
 
-        if self.warm_start:
-            self._last_position = best_position.copy()
-
-        population = np.vstack(all_positions) if all_positions else np.empty((0, best_position.size), dtype=float)
-        values = np.concatenate(all_values) if all_values else np.empty((0,), dtype=float)
+        if candidate_positions.size == 0:
+            population = best_position.reshape(1, -1)
+            values = np.asarray([best_value], dtype=float)
+        else:
+            is_best_present = np.any(np.all(np.isclose(candidate_positions, best_position[None, :]), axis=1))
+            if is_best_present:
+                population = candidate_positions
+                values = candidate_values
+            else:
+                population = np.vstack([best_position, candidate_positions])
+                values = np.concatenate([[best_value], candidate_values])
         return OptimizationResult(
             best_position=best_position,
             best_value=best_value,
@@ -159,12 +161,14 @@ class CMAESOptimizer(Optimizer):
                 "theta_window_tol": float(self.config.theta_window_tol),
                 "component_sigma_tol": float(self.config.component_sigma_tol),
                 "component_weight_tol": float(self.config.component_weight_tol),
+                "warm_start_seed_count": int(anchor_positions.shape[0]),
+                "candidate_pool": "best_plus_final_iteration",
                 **stop_diagnostics,
             },
         )
 
     def reset(self) -> None:
-        self._last_position = None
+        self._rng = np.random.default_rng(self.config.seed)
 
     def _initial_state(self, bounds: tuple[np.ndarray, np.ndarray], anchors: np.ndarray) -> _MixtureState:
         dim = int(bounds[0].size)
@@ -172,9 +176,6 @@ class CMAESOptimizer(Optimizer):
         init_std = float(np.clip(self.config.init_std, self.config.min_std, self.config.max_std))
 
         seed_means = []
-        if self.warm_start and self._last_position is not None and self._last_position.shape == (dim,):
-            seed_means.append(np.clip(normalize_parameters(self._last_position, bounds), 0.0, 1.0))
-
         for anchor in anchors:
             if anchor.shape == (dim,):
                 seed_means.append(np.clip(normalize_parameters(anchor, bounds), 0.0, 1.0))
@@ -485,25 +486,17 @@ class CMAESOptimizer(Optimizer):
 
     @staticmethod
     def _resolve_bounds(problem: OptimizationProblem, anchors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if problem.lower_bound is not None and problem.upper_bound is not None:
-            low = np.asarray(problem.lower_bound, dtype=float)
-            high = np.asarray(problem.upper_bound, dtype=float)
-        elif anchors.size:
-            low = np.min(anchors, axis=0)
-            high = np.max(anchors, axis=0)
-            span = np.maximum(high - low, 1.0)
-            low = low - span
-            high = high + span
-        else:
-            raise ValueError("CMA-ES requires bounds or a non-empty initial population.")
+        del anchors
+        if problem.lower_bound is None or problem.upper_bound is None:
+            raise ValueError("CMA-ES requires explicit lower_bound and upper_bound.")
+        low = np.asarray(problem.lower_bound, dtype=float)
+        high = np.asarray(problem.upper_bound, dtype=float)
 
         if low.shape != high.shape:
             raise ValueError(f"Bounds shape mismatch: low={low.shape}, high={high.shape}")
         span = high - low
         if np.any(span <= 1e-12):
-            center = 0.5 * (low + high)
-            low = center - 0.5
-            high = center + 0.5
+            raise ValueError(f"CMA-ES bounds must have positive span in every dimension: low={low}, high={high}")
         return low.astype(float), high.astype(float)
 
     @staticmethod
@@ -530,12 +523,9 @@ class CMAESOptimizer(Optimizer):
 
     @staticmethod
     def _evaluate(problem: OptimizationProblem, position: np.ndarray) -> float:
-        try:
-            value = float(problem.objective(np.asarray(position, dtype=float)))
-        except Exception:
-            return float("inf")
+        value = float(problem.objective(np.asarray(position, dtype=float)))
         if not np.isfinite(value):
-            return float("inf")
+            raise FloatingPointError("CMA-ES scalar objective produced a non-finite value.")
         return value
 
     @classmethod
@@ -547,13 +537,12 @@ class CMAESOptimizer(Optimizer):
             positions = positions.reshape(1, -1)
 
         if problem.objective_batch is not None:
-            try:
-                values = np.asarray(problem.objective_batch(positions), dtype=float).reshape(-1)
-                if values.shape == (positions.shape[0],):
-                    values = values.copy()
-                    values[~np.isfinite(values)] = float("inf")
-                    return values
-            except Exception:
-                pass
+            values = np.asarray(problem.objective_batch(positions), dtype=float).reshape(-1)
+            expected_shape = (positions.shape[0],)
+            if values.shape != expected_shape:
+                raise ValueError(f"Batch objective shape mismatch: got {values.shape}, expected {expected_shape}.")
+            if not np.all(np.isfinite(values)):
+                raise FloatingPointError("CMA-ES batch objective produced non-finite values.")
+            return values
 
         return np.asarray([cls._evaluate(problem, position) for position in positions], dtype=float)

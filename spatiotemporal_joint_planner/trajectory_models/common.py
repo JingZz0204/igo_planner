@@ -104,7 +104,7 @@ def finite_difference(values: np.ndarray, t: np.ndarray) -> np.ndarray:
 def xy_from_sl(problem: PlanningProblem, s_values: np.ndarray, l_values: np.ndarray) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     ref_path = problem.ref_path
     if not hasattr(ref_path, "calc_position") or not hasattr(ref_path, "calc_yaw"):
-        return np.asarray(s_values, dtype=float), np.asarray(l_values, dtype=float)
+        raise TypeError("SL-to-XY conversion requires ref_path.calc_position and ref_path.calc_yaw.")
 
     x_values = []
     y_values = []
@@ -113,7 +113,7 @@ def xy_from_sl(problem: PlanningProblem, s_values: np.ndarray, l_values: np.ndar
         s_clamped = float(np.clip(float(s), 0.0, route_end))
         xy_ref = ref_path.calc_position(s_clamped)
         if xy_ref is None or xy_ref[0] is None or xy_ref[1] is None:
-            return None, None
+            raise ValueError(f"Reference path returned no position at s={s_clamped:.3f}.")
         yaw = float(ref_path.calc_yaw(s_clamped))
         x_values.append(float(xy_ref[0]) + float(l) * math.cos(yaw + math.pi / 2.0))
         y_values.append(float(xy_ref[1]) + float(l) * math.sin(yaw + math.pi / 2.0))
@@ -130,7 +130,7 @@ def project_xy_to_sl(
     x_values = np.asarray(x_values, dtype=float)
     y_values = np.asarray(y_values, dtype=float)
     if not hasattr(ref_path, "calc_position") or not hasattr(ref_path, "calc_yaw"):
-        return x_values.copy(), y_values.copy()
+        raise TypeError("XY-to-SL projection requires ref_path.calc_position and ref_path.calc_yaw.")
 
     route_end = _route_end_s(ref_path)
     ds = max(float(projection_ds), 0.05)
@@ -145,7 +145,7 @@ def project_xy_to_sl(
         ref_yaw.append(float(ref_path.calc_yaw(float(s))))
 
     if not ref_xy:
-        return x_values.copy(), y_values.copy()
+        raise ValueError("Reference path returned no valid samples for XY-to-SL projection.")
 
     ref_xy = np.asarray(ref_xy, dtype=float)
     ref_yaw = np.asarray(ref_yaw, dtype=float)
@@ -224,8 +224,9 @@ def curvature_from_xy(x: np.ndarray, y: np.ndarray, t: np.ndarray) -> np.ndarray
 
 
 def _route_end_s(ref_path) -> float:
-    if hasattr(ref_path, "s"):
-        values = np.asarray(ref_path.s, dtype=float)
-        if values.size:
-            return max(float(values[-1]), 1e-3)
-    return 1.0e6
+    if not hasattr(ref_path, "s"):
+        raise TypeError("Reference path must expose cumulative arc-length samples through .s.")
+    values = np.asarray(ref_path.s, dtype=float)
+    if not values.size:
+        raise ValueError("Reference path .s must not be empty.")
+    return max(float(values[-1]), 1e-3)

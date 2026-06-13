@@ -33,7 +33,7 @@ class BezierTrajectoryWarmStartConfig:
     fit_dt: float = 0.25
     terminal_position_weight: float = 2.0
     terminal_derivative_weight: float = 4.0
-    max_semantic_seeds: int = 88
+    max_semantic_seeds: int = 6
     target_speed_offsets: tuple[float, ...] = (0.0, -2.0, 2.0)
 
 
@@ -55,25 +55,24 @@ class BezierTrajectoryWarmStartGenerator(WarmStartGenerator):
         if context.previous_parameters is not None:
             rows.append(np.asarray(context.previous_parameters, dtype=float))
 
-        try:
-            nominal = np.asarray(context.trajectory_model.reference_parameters(context.problem), dtype=float)
-        except Exception:
-            nominal = 0.5 * (context.lower_bound + context.upper_bound)
+        nominal = np.asarray(context.trajectory_model.reference_parameters(context.problem), dtype=float)
         rows.append(nominal)
 
         rows.extend(self._semantic_rows(context, nominal))
         rows.extend(self._shifted_nominal_rows(nominal))
 
-        rows.append(0.5 * (context.lower_bound + context.upper_bound))
         return finalize_warm_starts(rows, context)
 
     def _semantic_rows(self, context: WarmStartContext, nominal: np.ndarray) -> list[np.ndarray]:
         if not self._has_bezier_helpers(context):
-            return []
+            raise TypeError(
+                f"Trajectory model {context.trajectory_model.name!r} is missing required Bezier warm-start helpers."
+            )
 
         candidates = self._candidate_tuples(context)
         rows = []
-        for l_target, v_end, t_l_finish in candidates[: max(int(self.config.max_semantic_seeds), 1)]:
+        max_count = max(min(int(self.config.max_semantic_seeds), int(context.max_count)), 1)
+        for l_target, v_end, t_l_finish in candidates[:max_count]:
             fitted = self._fit_semantic_seed(context, nominal, float(l_target), float(v_end), float(t_l_finish))
             if fitted is not None:
                 rows.append(fitted)
@@ -89,26 +88,23 @@ class BezierTrajectoryWarmStartGenerator(WarmStartGenerator):
     ) -> Optional[np.ndarray]:
         model = context.trajectory_model
         problem = context.problem
-        try:
-            fixed_control, x0, y0, yaw0 = self._fixed_control_points(context, nominal)
-            t, s_values, world_points = self._semantic_world_points(context, l_target, v_end, t_l_finish)
-            local_points = model._world_to_local(world_points, x0, y0, yaw0)
-            degree = int(model._degree())
-            fixed = int(model._fixed_controls())
-            horizon = max(float(problem.horizon), 1e-3)
-            u_values = np.clip(t / horizon, 0.0, 1.0)
-            basis = model._bernstein_basis(degree, u_values)
-            return self._fit_free_controls(
-                context=context,
-                basis=basis,
-                fixed_control=fixed_control,
-                local_points=local_points,
-                s_end=float(s_values[-1]),
-                v_end=float(v_end),
-                yaw0=float(yaw0),
-            )
-        except Exception:
-            return None
+        fixed_control, x0, y0, yaw0 = self._fixed_control_points(context, nominal)
+        t, s_values, world_points = self._semantic_world_points(context, l_target, v_end, t_l_finish)
+        local_points = model._world_to_local(world_points, x0, y0, yaw0)
+        degree = int(model._degree())
+        fixed = int(model._fixed_controls())
+        horizon = max(float(problem.horizon), 1e-3)
+        u_values = np.clip(t / horizon, 0.0, 1.0)
+        basis = model._bernstein_basis(degree, u_values)
+        return self._fit_free_controls(
+            context=context,
+            basis=basis,
+            fixed_control=fixed_control,
+            local_points=local_points,
+            s_end=float(s_values[-1]),
+            v_end=float(v_end),
+            yaw0=float(yaw0),
+        )
 
     def _semantic_world_points(
         self,
@@ -307,8 +303,8 @@ class BezierTrajectoryWarmStartGenerator(WarmStartGenerator):
             if key in metadata:
                 try:
                     return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return None
 
     def _target_speed(self, context: WarmStartContext) -> float:
@@ -317,8 +313,8 @@ class BezierTrajectoryWarmStartGenerator(WarmStartGenerator):
             if key in metadata:
                 try:
                     return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return float(self.config.max_terminal_speed)
 
     def _obstacle_nudges(self, context: WarmStartContext) -> list[float]:
@@ -367,7 +363,7 @@ class BezierTrajectoryWarmStartGenerator(WarmStartGenerator):
     def _reference_yaw(self, context: WarmStartContext, s_value: float) -> float:
         ref_path = context.problem.ref_path
         if not hasattr(ref_path, "calc_yaw"):
-            return float(context.problem.ego.yaw or 0.0)
+            raise TypeError("Bezier warm start requires ref_path.calc_yaw.")
         route_end = self._route_end_s(ref_path)
         return float(ref_path.calc_yaw(float(np.clip(s_value, 0.0, route_end))))
 
@@ -386,35 +382,50 @@ class BezierTrajectoryWarmStartGenerator(WarmStartGenerator):
 
     def _blocked_ranges(self, actors: Sequence[ActorPrediction]) -> list[dict]:
         ranges = []
+        keys = ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")
         for actor in actors:
             metadata = dict(actor.metadata or {})
-            if all(key in metadata for key in ("blocked_s_min", "blocked_s_max", "blocked_l_min", "blocked_l_max")):
-                ranges.append(
-                    self._inflate_blocked_range(
-                        {
-                            "s_min": float(metadata["blocked_s_min"]),
-                            "s_max": float(metadata["blocked_s_max"]),
-                            "l_min": float(metadata["blocked_l_min"]),
-                            "l_max": float(metadata["blocked_l_max"]),
-                            "actor_id": actor.actor_id,
-                        }
-                    )
-                )
+            if any(key in metadata for key in keys) and not all(key in metadata for key in keys):
+                missing = [key for key in keys if key not in metadata]
+                raise ValueError(f"Actor {actor.actor_id!r} warm-start blocked range is missing fields: {missing}.")
+            if all(key in metadata for key in keys):
+                blocked = {
+                    "s_min": float(metadata["blocked_s_min"]),
+                    "s_max": float(metadata["blocked_s_max"]),
+                    "l_min": float(metadata["blocked_l_min"]),
+                    "l_max": float(metadata["blocked_l_max"]),
+                    "actor_id": actor.actor_id,
+                }
+            elif ("s" in metadata) != ("l" in metadata):
+                raise ValueError(f"Actor {actor.actor_id!r} warm-start metadata must provide both s and l.")
             elif "s" in metadata and "l" in metadata:
                 half_length = 0.5 * float(actor.length)
                 half_width = 0.5 * float(actor.width)
-                ranges.append(
-                    self._inflate_blocked_range(
-                        {
-                            "s_min": float(metadata["s"]) - half_length,
-                            "s_max": float(metadata["s"]) + half_length,
-                            "l_min": float(metadata["l"]) - half_width,
-                            "l_max": float(metadata["l"]) + half_width,
-                            "actor_id": actor.actor_id,
-                        }
-                    )
+                blocked = {
+                    "s_min": float(metadata["s"]) - half_length,
+                    "s_max": float(metadata["s"]) + half_length,
+                    "l_min": float(metadata["l"]) - half_width,
+                    "l_max": float(metadata["l"]) + half_width,
+                    "actor_id": actor.actor_id,
+                }
+            else:
+                raise ValueError(
+                    f"Actor {actor.actor_id!r} must provide blocked_s/l bounds or an s/l pose for warm start."
                 )
+            self._validate_blocked_range(blocked)
+            ranges.append(self._inflate_blocked_range(blocked))
         return ranges
+
+    @staticmethod
+    def _validate_blocked_range(blocked: dict) -> None:
+        values = np.asarray(
+            [blocked["s_min"], blocked["s_max"], blocked["l_min"], blocked["l_max"]],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Actor {blocked['actor_id']!r} warm-start blocked range must be finite.")
+        if float(blocked["s_min"]) > float(blocked["s_max"]) or float(blocked["l_min"]) > float(blocked["l_max"]):
+            raise ValueError(f"Actor {blocked['actor_id']!r} warm-start blocked range has inverted bounds.")
 
     def _inflate_blocked_range(self, blocked: dict) -> dict:
         s_buffer = max(float(self.config.planning_obstacle_s_buffer), 0.0)
@@ -452,11 +463,12 @@ class BezierTrajectoryWarmStartGenerator(WarmStartGenerator):
 
     @staticmethod
     def _route_end_s(ref_path) -> float:
-        if hasattr(ref_path, "s"):
-            values = np.asarray(ref_path.s, dtype=float)
-            if values.size:
-                return max(float(values[-1]), 1e-3)
-        return 1.0e6
+        if not hasattr(ref_path, "s"):
+            raise TypeError("Reference path must expose cumulative arc-length samples through .s.")
+        values = np.asarray(ref_path.s, dtype=float)
+        if not values.size:
+            raise ValueError("Reference path .s must not be empty.")
+        return max(float(values[-1]), 1e-3)
 
     @staticmethod
     def _has_bezier_helpers(context: WarmStartContext) -> bool:

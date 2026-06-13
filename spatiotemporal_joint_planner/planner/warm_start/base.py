@@ -17,7 +17,7 @@ class WarmStartContext:
     lower_bound: np.ndarray
     upper_bound: np.ndarray
     previous_parameters: Optional[np.ndarray] = None
-    max_count: int = 32
+    max_count: int = 8
 
     @property
     def parameter_dim(self) -> int:
@@ -41,52 +41,31 @@ class WarmStartGenerator(ABC):
         """Return a 2D array of initial parameters or particles."""
 
 
-class DefaultWarmStartGenerator(WarmStartGenerator):
-    """Generic fallback: previous best, model reference, and bounds center."""
-
-    @property
-    def name(self) -> str:
-        return "default_warm_start"
-
-    def supports(self, context: WarmStartContext) -> bool:
-        return True
-
-    def generate(self, context: WarmStartContext) -> np.ndarray:
-        rows = []
-        if context.previous_parameters is not None:
-            rows.append(np.asarray(context.previous_parameters, dtype=float))
-
-        try:
-            rows.append(np.asarray(context.trajectory_model.reference_parameters(context.problem), dtype=float))
-        except Exception:
-            pass
-
-        rows.append(0.5 * (np.asarray(context.lower_bound, dtype=float) + np.asarray(context.upper_bound, dtype=float)))
-        return finalize_warm_starts(rows, context)
-
-
-class CompositeWarmStartGenerator(WarmStartGenerator):
-    """Combine several generators in priority order."""
+class ModelWarmStartGenerator(WarmStartGenerator):
+    """Select exactly one model-specific warm-start generator."""
 
     def __init__(self, generators: Sequence[WarmStartGenerator]):
         self.generators = list(generators)
 
     @property
     def name(self) -> str:
-        return "composite_warm_start"
+        return "model_warm_start"
 
     def supports(self, context: WarmStartContext) -> bool:
-        return any(generator.supports(context) for generator in self.generators)
+        return sum(generator.supports(context) for generator in self.generators) == 1
 
     def generate(self, context: WarmStartContext) -> np.ndarray:
-        rows = []
-        for generator in self.generators:
-            if not generator.supports(context):
-                continue
-            generated = generator.generate(context)
-            if generated.size:
-                rows.extend(np.asarray(generated, dtype=float))
-        return finalize_warm_starts(rows, context)
+        matched = [generator for generator in self.generators if generator.supports(context)]
+        if len(matched) != 1:
+            names = [generator.name for generator in matched]
+            raise ValueError(
+                f"Trajectory model {context.trajectory_model.name!r} must match exactly one warm-start "
+                f"generator, matched={names}"
+            )
+        generated = matched[0].generate(context)
+        if generated.size == 0:
+            raise ValueError(f"Warm-start generator {matched[0].name!r} returned no seeds.")
+        return finalize_warm_starts(generated, context)
 
 
 def default_parametric_warm_start_generator() -> WarmStartGenerator:
@@ -96,7 +75,7 @@ def default_parametric_warm_start_generator() -> WarmStartGenerator:
     from .frenet_via_bspline import FrenetViaBSplineWarmStartGenerator
     from .terminal_state import SvgdParticleWarmStartGenerator, TerminalStateWarmStartGenerator
 
-    return CompositeWarmStartGenerator(
+    return ModelWarmStartGenerator(
         [
             SvgdParticleWarmStartGenerator(),
             TerminalStateWarmStartGenerator(),
@@ -104,7 +83,6 @@ def default_parametric_warm_start_generator() -> WarmStartGenerator:
             FrenetBezierWarmStartGenerator(),
             FrenetBSplineWarmStartGenerator(),
             FrenetViaBSplineWarmStartGenerator(),
-            DefaultWarmStartGenerator(),
         ]
     )
 
@@ -118,10 +96,18 @@ def finalize_warm_starts(rows: Sequence[np.ndarray], context: WarmStartContext) 
 
     output = []
     seen = set()
-    for row in rows:
+    for index, row in enumerate(rows):
         value = np.asarray(row, dtype=float).reshape(-1)
-        if value.shape != (dim,) or not np.all(np.isfinite(value)):
-            continue
+        if value.shape != (dim,):
+            raise ValueError(
+                f"Warm-start seed {index} for trajectory model {context.trajectory_model.name!r} "
+                f"has shape {value.shape}, expected {(dim,)}."
+            )
+        if not np.all(np.isfinite(value)):
+            raise ValueError(
+                f"Warm-start seed {index} for trajectory model {context.trajectory_model.name!r} "
+                "contains non-finite values."
+            )
         value = np.clip(value, low, high)
         key = tuple(np.round(value, 8).tolist())
         if key in seen:
@@ -132,6 +118,5 @@ def finalize_warm_starts(rows: Sequence[np.ndarray], context: WarmStartContext) 
             break
 
     if not output:
-        center = 0.5 * (low + high)
-        output.append(center)
+        raise ValueError(f"No valid warm-start seeds for trajectory model {context.trajectory_model.name!r}.")
     return np.asarray(output, dtype=float)

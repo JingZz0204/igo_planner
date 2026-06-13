@@ -7,39 +7,72 @@ import numpy as np
 
 from spatiotemporal_joint_planner.game.base import GameOptimizationResult, GamePlayer, JointTrajectory
 from spatiotemporal_joint_planner.game.igo_game_optimizer import GameIGOConfig, GameIGOOptimizer
-from spatiotemporal_joint_planner.optimizer.cma_es_optimizer import denormalize_parameters
+from spatiotemporal_joint_planner.optimizer.cma_es_optimizer import denormalize_parameters, normalize_parameters
 
 
 @dataclass(frozen=True)
 class BayesianIGOConfig(GameIGOConfig):
+    """Configuration for synchronous type-conditioned Bayesian IGO flow."""
+
     equilibrium_check_interval: int = 3
-    equilibrium_regret_tol: float = 0.08
+    equilibrium_regret_tol: float = 0.1
     material_type_probability: float = 0.05
-    equilibrium_polish_rounds: int = 2
+    local_nash_samples: int = 16
+    local_nash_perturbation: float = 0.05
+    local_nash_seed: int = 1701
 
 
 @dataclass(frozen=True)
 class BayesianBatchEvaluation:
-    aggregate_ego_values: np.ndarray
-    ego_values_by_type: Mapping[str, np.ndarray]
-    target_values_by_type: Mapping[str, np.ndarray]
+    player_values: Mapping[str, np.ndarray]
     diagnostics: Mapping[str, np.ndarray] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BayesianPhysicalActor:
+    actor_id: str
+    players_by_type: Mapping[str, GamePlayer]
+    type_probabilities: Mapping[str, float]
 
 
 @dataclass(frozen=True)
 class BayesianGameOptimizationProblem:
     ego_player: GamePlayer
-    target_players_by_type: Mapping[str, GamePlayer]
-    type_probabilities: Mapping[str, float]
-    evaluate_batch: Callable[[np.ndarray, Mapping[str, np.ndarray]], BayesianBatchEvaluation]
-    evaluate_type_batch: Callable[[str, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]
+    physical_actors: Mapping[str, BayesianPhysicalActor]
+    evaluate_players_batch: Callable[[Mapping[str, np.ndarray]], BayesianBatchEvaluation]
+    evaluate_unilateral_batch: Callable[[str, np.ndarray, Mapping[str, np.ndarray]], np.ndarray]
     decode_joint: Callable[[Mapping[str, np.ndarray]], JointTrajectory]
     evaluate_joint: Callable[[JointTrajectory], Mapping[str, object]]
     metadata: Mapping[str, object] = field(default_factory=dict)
 
+    @property
+    def strategy_players(self) -> tuple[GamePlayer, ...]:
+        return (
+            self.ego_player,
+            *(
+                player
+                for actor in self.physical_actors.values()
+                for player in actor.players_by_type.values()
+            ),
+        )
+
+    @property
+    def material_probabilities_by_player(self) -> dict[str, float]:
+        result = {self.ego_player.name: 1.0}
+        for actor in self.physical_actors.values():
+            type_names = tuple(actor.players_by_type)
+            probabilities = BayesianIGOOptimizer._normalized_type_probabilities(actor.type_probabilities, type_names)
+            result.update(
+                {
+                    actor.players_by_type[type_name].name: float(probabilities[index])
+                    for index, type_name in enumerate(type_names)
+                }
+            )
+        return result
+
 
 class BayesianIGOOptimizer(GameIGOOptimizer):
-    """IGO solver for one physical opponent with type-conditioned policies."""
+    """Synchronous Bayesian IGO flow for any number of uncertain actors."""
 
     def __init__(self, config: Optional[BayesianIGOConfig] = None):
         super().__init__(config or BayesianIGOConfig())
@@ -47,236 +80,186 @@ class BayesianIGOOptimizer(GameIGOOptimizer):
 
     @property
     def name(self) -> str:
-        return "bayesian_igo_game"
+        return "synchronous_bayesian_igo_flow"
 
     def optimize(self, problem: BayesianGameOptimizationProblem) -> GameOptimizationResult:
         ego = problem.ego_player
-        type_names = tuple(problem.target_players_by_type.keys())
-        if not type_names:
-            raise ValueError("Bayesian IGO requires at least one target type.")
-        probabilities = self._normalized_type_probabilities(problem.type_probabilities, type_names)
-        strategy_players = (ego, *(problem.target_players_by_type[name] for name in type_names))
-        strategy_names = [player.name for player in strategy_players]
+        players = problem.strategy_players
+        if len(players) <= 1:
+            raise ValueError("Bayesian IGO requires at least one physical interaction actor.")
+        player_names = [player.name for player in players]
+        material_probabilities = problem.material_probabilities_by_player
         bounds = {
             player.name: (np.asarray(player.lower_bound, dtype=float), np.asarray(player.upper_bound, dtype=float))
-            for player in strategy_players
+            for player in players
         }
         anchors = {
-            player.name: self._clip_positions_to_bounds(self._as_anchor_matrix(player.initial_population), bounds[player.name])
-            for player in strategy_players
+            player.name: self._clip_positions_to_bounds(
+                self._as_anchor_matrix(player.initial_population),
+                bounds[player.name],
+            )
+            for player in players
         }
         states = {
             player.name: self._initial_state(player.name, bounds[player.name], anchors[player.name])
-            for player in strategy_players
+            for player in players
         }
 
-        joint_batches: list[dict[str, np.ndarray]] = []
-        ego_value_batches: list[np.ndarray] = []
-        target_value_batches: dict[str, list[np.ndarray]] = {name: [] for name in type_names}
-        player_positions: dict[str, list[np.ndarray]] = {name: [] for name in strategy_names}
-        player_values: dict[str, list[np.ndarray]] = {name: [] for name in strategy_names}
-        best_value_history: dict[str, list[float]] = {name: [] for name in strategy_names}
-        best_unit_history: dict[str, list[np.ndarray]] = {name: [] for name in strategy_names}
-        selected_unit_history: list[np.ndarray] = []
-        selected_cost_history: list[np.ndarray] = []
+        player_positions = {name: np.empty((0, bounds[name][0].size), dtype=float) for name in player_names}
+        player_values = {name: np.empty((0,), dtype=float) for name in player_names}
+        profile_value_history: dict[str, list[float]] = {name: [] for name in player_names}
+        profile_unit_history: dict[str, list[np.ndarray]] = {name: [] for name in player_names}
+        joint_unit_history: list[np.ndarray] = []
+        joint_cost_history: list[np.ndarray] = []
         history: list[dict] = []
+
+        best_parameters = self._representative_profile(states, bounds, players)
+        best_evaluation = self._evaluate_profile(problem, best_parameters)
+        best_selection = self._profile_selection(best_evaluation, ego.name)
         stop_reason = "max_iterations"
-        stop_diagnostics: dict[str, float] = self._equilibrium_not_evaluated(type_names)
+        local_nash_diagnostics = self._local_nash_not_evaluated(player_names)
+        last_flow_diagnostics: dict[str, float] = {}
+        local_nash_check_count = 0
+        flow_batch_evaluations = 0
 
-        initial_samples = self._initial_paired_samples(strategy_players, anchors, bounds)
-        if initial_samples:
-            initial_evaluation = problem.evaluate_batch(
-                initial_samples[ego.name],
-                {
-                    name: initial_samples[problem.target_players_by_type[name].name]
-                    for name in type_names
-                },
-            )
-            self._record_batch(
-                initial_samples,
-                initial_evaluation,
-                ego,
-                type_names,
-                problem.target_players_by_type,
-                joint_batches,
-                ego_value_batches,
-                target_value_batches,
-                player_positions,
-                player_values,
-            )
-
-        best_parameters: Optional[dict[str, np.ndarray]] = None
-        best_selection: dict[str, object] = {}
         for iteration in range(max(int(self.config.n_iterations), 0)):
-            unit_samples: dict[str, np.ndarray] = {}
-            component_ids: dict[str, np.ndarray] = {}
-            parameter_samples: dict[str, np.ndarray] = {}
-            for player in strategy_players:
-                units, ids = self._sample_population(states[player.name])
-                unit_samples[player.name] = units
-                component_ids[player.name] = ids
-                parameter_samples[player.name] = denormalize_parameters(units, bounds[player.name])
-
-            evaluation = problem.evaluate_batch(
-                parameter_samples[ego.name],
-                {
-                    name: parameter_samples[problem.target_players_by_type[name].name]
-                    for name in type_names
-                },
-            )
-            self._record_batch(
+            unit_samples, component_ids, parameter_samples = self._sample_all(states, bounds, players)
+            evaluation = self._evaluate_samples(problem, parameter_samples)
+            flow_batch_evaluations += 1
+            self._record_flow_batch(
                 parameter_samples,
                 evaluation,
-                ego,
-                type_names,
-                problem.target_players_by_type,
-                joint_batches,
-                ego_value_batches,
-                target_value_batches,
                 player_positions,
                 player_values,
             )
-
-            iteration_values = {ego.name: np.asarray(evaluation.aggregate_ego_values, dtype=float)}
-            for type_name in type_names:
-                player_name = problem.target_players_by_type[type_name].name
-                iteration_values[player_name] = np.asarray(evaluation.target_values_by_type[type_name], dtype=float)
-            for player in strategy_players:
-                values = iteration_values[player.name]
-                best_idx = int(np.argmin(values))
-                best_value_history[player.name].append(float(values[best_idx]))
-                best_unit_history[player.name].append(np.asarray(unit_samples[player.name][best_idx], dtype=float).copy())
-                states[player.name] = self._update_distribution(
+            values = self._player_values(evaluation)
+            states = {
+                player.name: self._update_distribution(
                     states[player.name],
                     unit_samples[player.name],
                     component_ids[player.name],
-                    values,
+                    values[player.name],
                     iteration,
                 )
+                for player in players
+            }
 
-            best_parameters, best_selection = self._select_bayesian_joint_candidate(
-                joint_batches,
-                ego_value_batches,
-                target_value_batches,
-                ego,
-                type_names,
-                problem.target_players_by_type,
-                probabilities,
-            )
-            selected_unit_history.append(self._joint_unit_vector(best_parameters, bounds, strategy_names))
-            selected_cost_history.append(
-                np.asarray(
-                    [
-                        float(best_selection.get("selection_ego_value", float("inf"))),
-                        *[
-                            float(best_selection.get(f"selection_{type_name}_target_value", float("inf")))
-                            for type_name in type_names
-                        ],
-                    ],
-                    dtype=float,
+            best_parameters = self._representative_profile(states, bounds, players)
+            best_evaluation = self._evaluate_profile(problem, best_parameters)
+            best_selection = self._profile_selection(best_evaluation, ego.name)
+            profile_values = self._player_values(best_evaluation)
+            for player in players:
+                profile_value_history[player.name].append(float(profile_values[player.name][0]))
+                profile_unit_history[player.name].append(
+                    normalize_parameters(best_parameters[player.name], bounds[player.name])
                 )
+            joint_unit_history.append(self._joint_unit_vector(best_parameters, bounds, player_names))
+            joint_cost_history.append(
+                np.asarray([profile_values[name][0] for name in player_names], dtype=float)
             )
-            search_diagnostics = self._early_stop_diagnostics(best_value_history, best_unit_history, states)
-            joint_diagnostics = self._joint_stop_diagnostics(selected_unit_history, selected_cost_history)
-            equilibrium_diagnostics = self._equilibrium_not_evaluated(type_names)
-            search_stable = float(search_diagnostics.get("all_players_search_converged", 0.0)) > 0.5
+
+            search_diagnostics = self._early_stop_diagnostics(profile_value_history, profile_unit_history, states)
+            joint_diagnostics = self._joint_stop_diagnostics(joint_unit_history, joint_cost_history)
+            flow_stable = self._flow_stable(search_diagnostics, joint_diagnostics, iteration + 1)
             interval = max(int(self.config.equilibrium_check_interval), 1)
-            if (
+            can_check = (
                 bool(self.config.nash_check)
-                and search_stable
-                and int(iteration + 1) >= max(int(self.config.min_iterations), 0)
-                and int(iteration + 1) % interval == 0
-            ):
-                best_parameters, equilibrium_diagnostics = self._polish_bayesian_equilibrium(
+                and flow_stable
+                and (iteration + 1) % interval == 0
+            )
+            if can_check:
+                local_nash_check_count += 1
+                local_nash_diagnostics = self._local_nash_check(
                     problem=problem,
                     selected_parameters=best_parameters,
-                    current_samples=parameter_samples,
-                    current_values=iteration_values,
-                    anchors=anchors,
-                    states=states,
-                    ego=ego,
-                    type_names=type_names,
-                    probabilities=probabilities,
+                    players=players,
+                    material_probabilities=material_probabilities,
+                    check_index=local_nash_check_count,
                 )
+
             stop_diagnostics = {
                 **search_diagnostics,
                 **joint_diagnostics,
-                **equilibrium_diagnostics,
+                **local_nash_diagnostics,
+                "bayesian_equilibrium_converged": float(
+                    local_nash_diagnostics.get("local_nash_converged", 0.0)
+                ),
+                "max_bayesian_regret": float(
+                    local_nash_diagnostics.get("local_max_bayesian_regret", float("inf"))
+                ),
+                "ego_bayesian_regret": float(
+                    local_nash_diagnostics.get("local_ego_regret", float("inf"))
+                ),
+                **{
+                    f"{name}_bayesian_regret": float(
+                        local_nash_diagnostics.get(f"local_{name}_regret", float("inf"))
+                    )
+                    for name in player_names
+                    if name != ego.name
+                },
             }
-            early_stop_trigger = self._bayesian_early_stop_trigger(iteration + 1, stop_diagnostics)
-            should_stop = early_stop_trigger is not None
+            last_flow_diagnostics = dict(stop_diagnostics)
+            should_stop = (
+                flow_stable
+                and bool(self.config.early_stop)
+                and (
+                    not bool(self.config.nash_check)
+                    or float(local_nash_diagnostics.get("local_nash_converged", 0.0)) > 0.5
+                )
+            )
             if should_stop:
-                stop_reason = f"early_stop:{early_stop_trigger}"
+                stop_reason = (
+                    "early_stop:local_bayesian_nash"
+                    if bool(self.config.nash_check)
+                    else "early_stop:bayesian_igo_flow_stable"
+                )
+
             history.append(
                 {
                     "iteration": int(iteration),
                     "stop_reason": stop_reason if should_stop else None,
-                    "ego_best_value": float(np.min(iteration_values[ego.name])),
+                    "flow_stable": float(flow_stable),
+                    "ego_profile_value": float(profile_values[ego.name][0]),
                     "ego_mean_sigma": self._mean_sigma(states[ego.name]),
-                    **{
-                        f"{type_name}_target_best_value": float(
-                            np.min(iteration_values[problem.target_players_by_type[type_name].name])
-                        )
-                        for type_name in type_names
-                    },
-                    **{
-                        f"{type_name}_target_mean_sigma": self._mean_sigma(
-                            states[problem.target_players_by_type[type_name].name]
-                        )
-                        for type_name in type_names
-                    },
+                    **{f"{name}_profile_value": float(profile_values[name][0]) for name in player_names if name != ego.name},
+                    **{f"{name}_mean_sigma": self._mean_sigma(states[name]) for name in player_names if name != ego.name},
                     **stop_diagnostics,
                 }
             )
             if should_stop:
                 break
 
-        if best_parameters is None:
-            if not joint_batches:
-                raise RuntimeError("Bayesian IGO did not evaluate any joint samples.")
-            best_parameters, best_selection = self._select_bayesian_joint_candidate(
-                joint_batches,
-                ego_value_batches,
-                target_value_batches,
-                ego,
-                type_names,
-                problem.target_players_by_type,
-                probabilities,
-            )
-
-        if bool(self.config.nash_check) and not np.isfinite(float(stop_diagnostics.get("max_bayesian_regret", np.inf))):
-            best_parameters, final_equilibrium = self._polish_bayesian_equilibrium(
+        if bool(self.config.nash_check) and local_nash_check_count == 0:
+            local_nash_check_count += 1
+            local_nash_diagnostics = self._local_nash_check(
                 problem=problem,
                 selected_parameters=best_parameters,
-                current_samples={
-                    name: np.vstack(chunks) if chunks else np.empty((0, bounds[name][0].size), dtype=float)
-                    for name, chunks in player_positions.items()
-                },
-                current_values={
-                    name: np.concatenate(chunks) if chunks else np.empty((0,), dtype=float)
-                    for name, chunks in player_values.items()
-                },
-                anchors=anchors,
-                states=states,
-                ego=ego,
-                type_names=type_names,
-                probabilities=probabilities,
+                players=players,
+                material_probabilities=material_probabilities,
+                check_index=local_nash_check_count,
             )
-            stop_diagnostics = {
-                **stop_diagnostics,
-                **final_equilibrium,
-            }
 
         best_joint = problem.decode_joint(best_parameters)
         best_costs = dict(problem.evaluate_joint(best_joint))
-        self._last_positions = {name: np.asarray(value, dtype=float).copy() for name, value in best_parameters.items()}
-        populations = {
-            name: np.vstack(chunks) if chunks else np.empty((0, bounds[name][0].size), dtype=float)
-            for name, chunks in player_positions.items()
-        }
-        values = {
-            name: np.concatenate(chunks) if chunks else np.empty((0,), dtype=float)
-            for name, chunks in player_values.items()
+        final_diagnostics = {
+            **last_flow_diagnostics,
+            **local_nash_diagnostics,
+            "bayesian_equilibrium_converged": float(
+                local_nash_diagnostics.get("local_nash_converged", 0.0)
+            ),
+            "max_bayesian_regret": float(
+                local_nash_diagnostics.get("local_max_bayesian_regret", float("inf"))
+            ),
+            "ego_bayesian_regret": float(
+                local_nash_diagnostics.get("local_ego_regret", float("inf"))
+            ),
+            **{
+                f"{name}_bayesian_regret": float(
+                    local_nash_diagnostics.get(f"local_{name}_regret", float("inf"))
+                )
+                for name in player_names
+                if name != ego.name
+            },
         }
         return GameOptimizationResult(
             best_parameters=best_parameters,
@@ -286,279 +269,193 @@ class BayesianIGOOptimizer(GameIGOOptimizer):
             history=history,
             metadata={
                 "optimizer": self.name,
+                "solver_formulation": "synchronous_type_conditioned_bayesian_igo_flow",
                 "n_components": int(self.config.n_components),
                 "n_samples": int(self.config.n_samples),
                 "n_iterations": int(self.config.n_iterations),
                 "executed_iterations": int(len(history)),
+                "flow_batch_evaluations": int(flow_batch_evaluations),
                 "stop_reason": stop_reason,
                 "early_stop": bool(self.config.early_stop),
-                "physical_players": (ego.name, "target_rear"),
-                "target_types": type_names,
-                "type_probabilities": {name: float(probabilities[idx]) for idx, name in enumerate(type_names)},
+                "physical_players": (ego.name, *problem.physical_actors.keys()),
+                "strategy_players": tuple(player_names),
+                "actor_type_probabilities": {
+                    actor_id: dict(actor.type_probabilities)
+                    for actor_id, actor in problem.physical_actors.items()
+                },
                 "bayesian_equilibrium_check": bool(self.config.nash_check),
                 "equilibrium_regret_tol": float(self.config.equilibrium_regret_tol),
                 "equilibrium_check_interval": int(self.config.equilibrium_check_interval),
-                "equilibrium_polish_rounds": int(self.config.equilibrium_polish_rounds),
-                "nash_check": False,
+                "local_nash_check_count": int(local_nash_check_count),
+                "local_nash_samples": int(self.config.local_nash_samples),
+                "local_nash_perturbation": float(self.config.local_nash_perturbation),
+                "best_response_feedback_count": 0,
+                "candidate_pool": "final_iteration",
+                "nash_check": bool(self.config.nash_check),
                 **best_selection,
-                **stop_diagnostics,
+                **final_diagnostics,
             },
-            player_populations=populations,
-            player_values=values,
+            player_populations=player_positions,
+            player_values=player_values,
             joint_merit=None,
         )
 
-    def _record_batch(
-        self,
-        samples: Mapping[str, np.ndarray],
-        evaluation: BayesianBatchEvaluation,
-        ego: GamePlayer,
-        type_names: tuple[str, ...],
-        target_players: Mapping[str, GamePlayer],
-        joint_batches: list[dict[str, np.ndarray]],
-        ego_value_batches: list[np.ndarray],
-        target_value_batches: dict[str, list[np.ndarray]],
-        player_positions: dict[str, list[np.ndarray]],
-        player_values: dict[str, list[np.ndarray]],
-    ) -> None:
-        joint_batches.append({name: np.asarray(value, dtype=float) for name, value in samples.items()})
-        ego_values = self._finite_values(evaluation.aggregate_ego_values)
-        ego_value_batches.append(ego_values)
-        player_positions[ego.name].append(np.asarray(samples[ego.name], dtype=float))
-        player_values[ego.name].append(ego_values)
-        for type_name in type_names:
-            player_name = target_players[type_name].name
-            values = self._finite_values(evaluation.target_values_by_type[type_name])
-            target_value_batches[type_name].append(values)
-            player_positions[player_name].append(np.asarray(samples[player_name], dtype=float))
-            player_values[player_name].append(values)
-
-    def _initial_paired_samples(
-        self,
-        players: tuple[GamePlayer, ...],
-        anchors: Mapping[str, np.ndarray],
-        bounds: Mapping[str, tuple[np.ndarray, np.ndarray]],
-    ) -> dict[str, np.ndarray]:
-        count = min(
-            max(int(self.config.max_anchor_samples), 1),
-            max((int(value.shape[0]) for value in anchors.values()), default=1),
-        )
-        result = {}
+    def _sample_all(self, states, bounds, players):
+        unit_samples = {}
+        component_ids = {}
+        parameter_samples = {}
         for player in players:
-            values = anchors[player.name]
-            if values.size == 0:
-                values = player.trajectory_model.reference_parameters(player.problem).reshape(1, -1)
-            rows = [values[idx % values.shape[0]] for idx in range(count)]
-            result[player.name] = self._clip_positions_to_bounds(np.asarray(rows, dtype=float), bounds[player.name])
-        return result
+            units, ids = self._sample_population(states[player.name])
+            unit_samples[player.name] = units
+            component_ids[player.name] = ids
+            parameter_samples[player.name] = denormalize_parameters(units, bounds[player.name])
+        return unit_samples, component_ids, parameter_samples
 
-    def _select_bayesian_joint_candidate(
+    @staticmethod
+    def _evaluate_samples(problem, parameters):
+        return problem.evaluate_players_batch(parameters)
+
+    def _evaluate_profile(self, problem, parameters):
+        batched = {
+            name: np.asarray(value, dtype=float).reshape(1, -1)
+            for name, value in parameters.items()
+        }
+        return self._evaluate_samples(problem, batched)
+
+    @staticmethod
+    def _player_values(evaluation):
+        return {
+            name: np.asarray(values, dtype=float).reshape(-1)
+            for name, values in evaluation.player_values.items()
+        }
+
+    def _record_flow_batch(
         self,
-        joint_batches: list[dict[str, np.ndarray]],
-        ego_value_batches: list[np.ndarray],
-        target_value_batches: Mapping[str, list[np.ndarray]],
-        ego: GamePlayer,
-        type_names: tuple[str, ...],
-        target_players: Mapping[str, GamePlayer],
-        probabilities: np.ndarray,
-    ) -> tuple[dict[str, np.ndarray], dict[str, object]]:
-        parameters = {
-            ego.name: np.vstack([batch[ego.name] for batch in joint_batches]),
+        parameters,
+        evaluation,
+        player_positions,
+        player_values,
+    ) -> None:
+        values = self._player_values(evaluation)
+        for name, samples in parameters.items():
+            player_positions[name] = np.asarray(samples, dtype=float)
+            player_values[name] = self._finite_values(values[name])
+
+    def _representative_profile(self, states, bounds, players) -> dict[str, np.ndarray]:
+        profile = {}
+        for player in players:
+            state = states[player.name]
+            weights = np.asarray(state.weights, dtype=float)
+            radii = self._component_radii(state)
+            eligible = np.where(weights >= float(self.config.component_weight_tol))[0]
+            candidates = eligible if eligible.size else np.arange(weights.size)
+            component_index = min(
+                (int(index) for index in candidates),
+                key=lambda index: (-float(weights[index]), float(radii[index])),
+            )
+            unit = np.clip(state.components[component_index].mean, 0.0, 1.0)
+            profile[player.name] = denormalize_parameters(unit, bounds[player.name])
+        return profile
+
+    @staticmethod
+    def _profile_selection(evaluation, ego_name: str) -> dict[str, object]:
+        return {
+            "selection_index": -1,
+            "selection_mode": "bayesian_igo_flow_representative_profile",
+            "selection_ego_value": float(np.asarray(evaluation.player_values[ego_name], dtype=float)[0]),
             **{
-                target_players[name].name: np.vstack([batch[target_players[name].name] for batch in joint_batches])
-                for name in type_names
+                f"selection_{name}_value": float(np.asarray(values, dtype=float)[0])
+                for name, values in evaluation.player_values.items()
+                if name != ego_name
             },
         }
-        ego_values = np.concatenate(ego_value_batches)
-        target_values = {name: np.concatenate(target_value_batches[name]) for name in type_names}
-        count = int(ego_values.size)
-        finite = np.isfinite(ego_values)
-        for name in type_names:
-            finite &= np.isfinite(target_values[name])
-        if not np.any(finite):
-            index = 0
-            mode = "fallback_first_no_finite"
-        else:
-            target_ranks = {name: self._normalized_ranks(target_values[name]) for name in type_names}
-            gate = finite.copy()
-            for idx, name in enumerate(type_names):
-                if float(probabilities[idx]) >= float(self.config.material_type_probability):
-                    gate &= target_ranks[name] <= float(self.config.opponent_rank_gate)
-            candidates = np.where(gate if np.any(gate) else finite)[0]
-            weighted_target_rank = np.sum(
-                np.asarray([probabilities[idx] * target_ranks[name][candidates] for idx, name in enumerate(type_names)]),
-                axis=0,
-            )
-            order = np.lexsort((weighted_target_rank, ego_values[candidates]))
-            index = int(candidates[int(order[0])])
-            mode = "ego_min_with_type_conditioned_target_gate" if np.any(gate) else "fallback_ego_min"
-        selected = {name: values[index].copy() for name, values in parameters.items()}
-        diagnostics: dict[str, object] = {
-            "selection_index": int(index),
-            "selection_mode": mode,
-            "selection_ego_value": float(ego_values[index]),
-        }
-        for name in type_names:
-            diagnostics[f"selection_{name}_target_value"] = float(target_values[name][index])
-        return selected, diagnostics
 
-    def _bayesian_equilibrium_diagnostics(
+    def _flow_stable(self, search_diagnostics, joint_diagnostics, iteration_count: int) -> bool:
+        if int(iteration_count) < max(int(self.config.min_iterations), 0):
+            return False
+        search_ok = float(search_diagnostics.get("all_players_search_converged", 0.0)) > 0.5
+        joint_ok = (
+            float(joint_diagnostics.get("joint_theta_window_converged", 0.0)) > 0.5
+            or float(joint_diagnostics.get("joint_cost_window_converged", 0.0)) > 0.5
+        )
+        return bool(search_ok and joint_ok)
+
+    def _local_nash_check(
         self,
         problem: BayesianGameOptimizationProblem,
         selected_parameters: Mapping[str, np.ndarray],
-        current_samples: Mapping[str, np.ndarray],
-        current_values: Mapping[str, np.ndarray],
-        anchors: Mapping[str, np.ndarray],
-        states,
-        ego: GamePlayer,
-        type_names: tuple[str, ...],
-        probabilities: np.ndarray,
+        players: tuple[GamePlayer, ...],
+        material_probabilities: Mapping[str, float],
+        check_index: int,
     ) -> dict[str, float]:
-        selected_targets = {
-            name: np.asarray(selected_parameters[problem.target_players_by_type[name].name], dtype=float)
-            for name in type_names
-        }
-        ego_candidates = self._nash_candidate_matrix(
-            ego.name,
-            selected_parameters,
-            current_samples.get(ego.name),
-            current_values.get(ego.name),
-            anchors.get(ego.name),
-            states[ego.name],
-            (np.asarray(ego.lower_bound, dtype=float), np.asarray(ego.upper_bound, dtype=float)),
-        )
-        target_batches = {
-            name: np.repeat(selected_targets[name].reshape(1, -1), ego_candidates.shape[0], axis=0)
-            for name in type_names
-        }
-        ego_values = self._finite_values(problem.evaluate_batch(ego_candidates, target_batches).aggregate_ego_values)
-        ego_regret = self._normalized_regret(ego_values)
-        diagnostics: dict[str, float] = {"ego_bayesian_regret": ego_regret}
-        regrets = [ego_regret]
-        material_flags = [np.isfinite(ego_regret)]
-        for idx, type_name in enumerate(type_names):
-            player = problem.target_players_by_type[type_name]
-            candidates = self._nash_candidate_matrix(
-                player.name,
-                selected_parameters,
-                current_samples.get(player.name),
-                current_values.get(player.name),
-                anchors.get(player.name),
-                states[player.name],
-                (np.asarray(player.lower_bound, dtype=float), np.asarray(player.upper_bound, dtype=float)),
-            )
-            repeated_ego = np.repeat(np.asarray(selected_parameters[ego.name], dtype=float).reshape(1, -1), candidates.shape[0], axis=0)
-            _ego_type_values, target_values = problem.evaluate_type_batch(type_name, repeated_ego, candidates)
-            regret = self._normalized_regret(target_values)
-            diagnostics[f"{type_name}_target_bayesian_regret"] = regret
-            if float(probabilities[idx]) >= float(self.config.material_type_probability):
-                regrets.append(regret)
-                material_flags.append(np.isfinite(regret))
-        max_regret = float(np.max(regrets)) if regrets else float("inf")
-        diagnostics["max_bayesian_regret"] = max_regret
-        diagnostics["bayesian_equilibrium_converged"] = float(
-            all(material_flags) and max_regret <= float(self.config.equilibrium_regret_tol)
+        diagnostics: dict[str, float] = {}
+        material_regrets = []
+        for index, player in enumerate(players):
+            selected = np.asarray(selected_parameters[player.name], dtype=float)
+            candidates = self._local_perturbation_candidates(player, selected, check_index, index)
+            values = self._finite_values(problem.evaluate_unilateral_batch(player.name, candidates, selected_parameters))
+            best_index = int(np.argmin(values))
+            best_cost = float(values[best_index])
+            regret = self._normalized_regret(np.asarray([values[0], best_cost], dtype=float))
+            prefix = "ego" if player.name == problem.ego_player.name else player.name
+            diagnostics[f"local_{prefix}_current_cost"] = float(values[0])
+            diagnostics[f"local_{prefix}_best_response_cost"] = best_cost
+            diagnostics[f"local_{prefix}_regret"] = float(regret)
+            diagnostics[f"local_{prefix}_candidate_count"] = float(candidates.shape[0])
+            if float(material_probabilities.get(player.name, 1.0)) >= float(self.config.material_type_probability):
+                material_regrets.append(regret)
+
+        max_regret = float(np.max(material_regrets)) if material_regrets else float("inf")
+        diagnostics["local_max_bayesian_regret"] = max_regret
+        diagnostics["local_nash_converged"] = float(
+            np.isfinite(max_regret) and max_regret <= float(self.config.equilibrium_regret_tol)
         )
         return diagnostics
 
-    def _polish_bayesian_equilibrium(
+    def _local_perturbation_candidates(
         self,
-        problem: BayesianGameOptimizationProblem,
-        selected_parameters: Mapping[str, np.ndarray],
-        current_samples: Mapping[str, np.ndarray],
-        current_values: Mapping[str, np.ndarray],
-        anchors: Mapping[str, np.ndarray],
-        states,
-        ego: GamePlayer,
-        type_names: tuple[str, ...],
-        probabilities: np.ndarray,
-    ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-        selected = {name: np.asarray(value, dtype=float).copy() for name, value in selected_parameters.items()}
-        rounds = max(int(self.config.equilibrium_polish_rounds), 0)
-        for _ in range(rounds):
-            for type_name in type_names:
-                player = problem.target_players_by_type[type_name]
-                candidates = self._nash_candidate_matrix(
-                    player.name,
-                    selected,
-                    current_samples.get(player.name),
-                    current_values.get(player.name),
-                    anchors.get(player.name),
-                    states[player.name],
-                    (np.asarray(player.lower_bound, dtype=float), np.asarray(player.upper_bound, dtype=float)),
-                )
-                repeated_ego = np.repeat(selected[ego.name].reshape(1, -1), candidates.shape[0], axis=0)
-                _ego_values, target_values = problem.evaluate_type_batch(type_name, repeated_ego, candidates)
-                finite_values = self._finite_values(target_values)
-                selected[player.name] = candidates[int(np.argmin(finite_values))].copy()
-
-            ego_candidates = self._nash_candidate_matrix(
-                ego.name,
-                selected,
-                current_samples.get(ego.name),
-                current_values.get(ego.name),
-                anchors.get(ego.name),
-                states[ego.name],
-                (np.asarray(ego.lower_bound, dtype=float), np.asarray(ego.upper_bound, dtype=float)),
-            )
-            target_batches = {
-                name: np.repeat(
-                    selected[problem.target_players_by_type[name].name].reshape(1, -1),
-                    ego_candidates.shape[0],
-                    axis=0,
-                )
-                for name in type_names
-            }
-            ego_values = self._finite_values(problem.evaluate_batch(ego_candidates, target_batches).aggregate_ego_values)
-            selected[ego.name] = ego_candidates[int(np.argmin(ego_values))].copy()
-
-        diagnostics = self._bayesian_equilibrium_diagnostics(
-            problem=problem,
-            selected_parameters=selected,
-            current_samples=current_samples,
-            current_values=current_values,
-            anchors=anchors,
-            states=states,
-            ego=ego,
-            type_names=type_names,
-            probabilities=probabilities,
+        player: GamePlayer,
+        selected: np.ndarray,
+        check_index: int,
+        seed_offset: int,
+    ) -> np.ndarray:
+        low = np.asarray(player.lower_bound, dtype=float)
+        high = np.asarray(player.upper_bound, dtype=float)
+        selected = np.clip(np.asarray(selected, dtype=float), low, high)
+        selected_unit = np.clip(normalize_parameters(selected, (low, high)), 0.0, 1.0)
+        sample_count = max(int(self.config.local_nash_samples), 0)
+        rng = np.random.default_rng(int(self.config.local_nash_seed) + 1009 * int(check_index) + int(seed_offset))
+        perturbation = max(float(self.config.local_nash_perturbation), 0.0)
+        random_units = np.clip(
+            selected_unit[None, :] + rng.normal(0.0, perturbation, size=(sample_count, selected_unit.size)),
+            0.0,
+            1.0,
         )
-        return selected, diagnostics
+        units = np.vstack([selected_unit, random_units])
+        return self._dedupe_rows(denormalize_parameters(units, (low, high)), (low, high))
 
-    def _bayesian_early_stop_trigger(self, iteration_count: int, diagnostics: Mapping[str, float]) -> Optional[str]:
-        if not bool(self.config.early_stop) or int(iteration_count) < max(int(self.config.min_iterations), 0):
-            return None
-        search_ok = float(diagnostics.get("all_players_search_converged", 0.0)) > 0.5
-        joint_ok = (
-            float(diagnostics.get("joint_theta_window_converged", 0.0)) > 0.5
-            or float(diagnostics.get("joint_cost_window_converged", 0.0)) > 0.5
-        )
-        if not search_ok or not joint_ok:
-            return None
-        if bool(self.config.nash_check):
-            if float(diagnostics.get("bayesian_equilibrium_converged", 0.0)) > 0.5:
-                return "bayesian_equilibrium_search_stable"
-            return None
-        return "bayesian_search_stable"
-
-    def _equilibrium_not_evaluated(self, type_names: tuple[str, ...]) -> dict[str, float]:
+    @staticmethod
+    def _local_nash_not_evaluated(player_names: list[str]) -> dict[str, float]:
         return {
-            "ego_bayesian_regret": float("inf"),
-            **{f"{name}_target_bayesian_regret": float("inf") for name in type_names},
-            "max_bayesian_regret": float("inf"),
-            "bayesian_equilibrium_converged": 0.0,
+            "local_ego_regret": float("inf"),
+            **{f"local_{name}_regret": float("inf") for name in player_names if name != "ego"},
+            "local_max_bayesian_regret": float("inf"),
+            "local_nash_converged": 0.0,
         }
 
     @staticmethod
     def _normalized_type_probabilities(probabilities: Mapping[str, float], type_names: tuple[str, ...]) -> np.ndarray:
         values = np.asarray([max(float(probabilities.get(name, 0.0)), 0.0) for name in type_names], dtype=float)
         total = float(np.sum(values))
-        return values / total if total > 1e-12 else np.full((len(type_names),), 1.0 / float(len(type_names)))
+        if not np.all(np.isfinite(values)) or total <= 1e-12:
+            raise ValueError(f"Bayesian type probabilities must contain positive finite mass: {probabilities}.")
+        return values / total
 
     @staticmethod
     def _finite_values(values: np.ndarray) -> np.ndarray:
         result = np.asarray(values, dtype=float).reshape(-1).copy()
-        result[~np.isfinite(result)] = float("inf")
+        if not np.all(np.isfinite(result)):
+            raise FloatingPointError("Bayesian IGO evaluator produced non-finite values.")
         return result
 
     @staticmethod

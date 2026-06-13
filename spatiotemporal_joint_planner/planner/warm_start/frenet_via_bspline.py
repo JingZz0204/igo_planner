@@ -35,17 +35,27 @@ class FrenetViaBSplineWarmStartGenerator(WarmStartGenerator):
         rows = []
         if context.previous_parameters is not None:
             rows.append(np.asarray(context.previous_parameters, dtype=float))
-        try:
-            rows.append(context.trajectory_model.reference_parameters(context.problem))
-        except Exception:
-            pass
+        rows.append(context.trajectory_model.reference_parameters(context.problem))
 
         low = np.asarray(context.lower_bound, dtype=float)
         high = np.asarray(context.upper_bound, dtype=float)
         current_l = float(context.problem.ego.l)
         target_l = float(np.clip(self._target_l(context), low[2], high[2]))
         current_speed = max(float(context.problem.ego.s_v), 0.0)
-        target_speed = self._target_speed(context)
+        target_speed = float(np.clip(self._target_speed(context), low[3], high[3]))
+        center_time = 0.5 * (low[0] + high[0])
+
+        rows.extend(
+            [
+                np.array([center_time, 0.5 * (current_l + target_l), target_l, target_speed], dtype=float),
+                np.array([high[0], target_l, target_l, target_speed], dtype=float),
+                np.array([center_time, current_l, current_l, current_speed], dtype=float),
+                np.array([center_time, 0.5 * (current_l + low[2]), low[2], target_speed], dtype=float),
+                np.array([center_time, 0.5 * (current_l + high[2]), high[2], target_speed], dtype=float),
+            ]
+        )
+        if len(rows) >= int(context.max_count):
+            return finalize_warm_starts(rows, context)
 
         terminal_l_values = self._terminal_l_values(context, current_l, target_l, low[2], high[2])
         speed_values = self._speed_values(current_speed, target_speed, low[3], high[3])
@@ -59,15 +69,17 @@ class FrenetViaBSplineWarmStartGenerator(WarmStartGenerator):
                 for t_mid in mid_times:
                     for speed in speed_values:
                         rows.append(np.array([float(t_mid), l_mid, float(l_end), float(speed)], dtype=float))
+                        if len(rows) >= int(context.max_count):
+                            return finalize_warm_starts(rows, context)
 
-        center_time = 0.5 * (low[0] + high[0])
         for lane_l in self._lane_centers(context):
             lane_l = float(np.clip(lane_l, low[2], high[2]))
             l_mid = 0.5 * (current_l + lane_l)
             for speed in speed_values:
                 rows.append(np.array([center_time, l_mid, lane_l, float(speed)], dtype=float))
+                if len(rows) >= int(context.max_count):
+                    return finalize_warm_starts(rows, context)
 
-        rows.append(0.5 * (low + high))
         return finalize_warm_starts(rows, context)
 
     def _mid_times(self, low: float, high: float) -> list[float]:
@@ -104,8 +116,8 @@ class FrenetViaBSplineWarmStartGenerator(WarmStartGenerator):
             if key in metadata:
                 try:
                     return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return float(context.problem.ego.l)
 
     @staticmethod
@@ -115,8 +127,8 @@ class FrenetViaBSplineWarmStartGenerator(WarmStartGenerator):
             if key in metadata:
                 try:
                     return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return float(context.problem.ego.s_v)
 
     @staticmethod
@@ -127,8 +139,8 @@ class FrenetViaBSplineWarmStartGenerator(WarmStartGenerator):
             return []
         try:
             return [float(value) for value in lane_centers]
-        except (TypeError, ValueError):
-            return []
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid lane_centers metadata: {lane_centers!r}") from exc
 
     @staticmethod
     def _ordered_unique(values: Sequence[float]) -> list[float]:

@@ -106,7 +106,7 @@ class FrenetViaBSplineTrajectoryModel(TrajectoryModel):
     def decode(self, parameters: np.ndarray, problem: PlanningProblem) -> Trajectory:
         arrays = self.decode_batch_arrays(np.asarray(parameters, dtype=float).reshape(1, -1), problem)
         metadata = self._metadata_from_arrays(np.asarray(parameters, dtype=float), arrays, problem)
-        return trajectory_from_sl(
+        trajectory = trajectory_from_sl(
             problem,
             arrays["t"],
             arrays["s"][0],
@@ -117,6 +117,8 @@ class FrenetViaBSplineTrajectoryModel(TrajectoryModel):
             l_a=arrays["l_a"][0],
             metadata=metadata,
         )
+        trajectory.kappa = np.asarray(arrays["kappa"][0], dtype=float).copy()
+        return trajectory
 
     def decode_batch_arrays(self, parameters_batch: np.ndarray, problem: PlanningProblem) -> dict:
         theta = np.asarray(parameters_batch, dtype=float)
@@ -301,8 +303,8 @@ class FrenetViaBSplineTrajectoryModel(TrajectoryModel):
             if key in metadata:
                 try:
                     return float(metadata[key])
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return float(problem.ego.l)
 
     def _target_speed(self, problem: PlanningProblem) -> float:
@@ -311,6 +313,6 @@ class FrenetViaBSplineTrajectoryModel(TrajectoryModel):
             if key in metadata:
                 try:
                     return min(float(metadata[key]), float(self.config.max_terminal_speed))
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid {key} metadata: {metadata[key]!r}") from exc
         return min(max(float(problem.ego.s_v), float(self.config.min_terminal_speed)), float(self.config.max_terminal_speed))

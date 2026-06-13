@@ -27,8 +27,8 @@ from spatiotemporal_joint_planner.trajectory_models import TrajectoryModel
 class ParametricPlannerConfig:
     candidate_limit: int = 16
     warm_start: bool = True
-    max_initial_anchors: int = 96
-    objective_mode: str = "auto"
+    max_initial_anchors: int = 8
+    objective_mode: str = "vectorized"
 
 
 class ParametricPlanner(Planner):
@@ -58,42 +58,32 @@ class ParametricPlanner(Planner):
         seeds = self._initial_population(problem, low, high)
 
         def objective(parameters: np.ndarray) -> float:
-            try:
-                trajectory = self.trajectory_model.decode(parameters, problem)
-                cost = self.cost_function.evaluate(trajectory, problem)
-            except Exception:
-                return float("inf")
+            trajectory = self.trajectory_model.decode(parameters, problem)
+            cost = self.cost_function.evaluate(trajectory, problem)
             if not np.isfinite(cost.total):
-                return float("inf")
+                raise FloatingPointError("Scalar parametric trajectory objective produced a non-finite cost.")
             return float(cost.total)
 
         def objective_batch(parameters_batch: np.ndarray) -> np.ndarray:
             parameters_batch = np.asarray(parameters_batch, dtype=float)
             if not hasattr(self.trajectory_model, "decode_batch_arrays"):
-                return np.asarray([objective(parameters) for parameters in parameters_batch], dtype=float)
-            batch_evaluator = getattr(self.cost_function, "evaluate_batch", None)
-            if batch_evaluator is None:
-                model_prefix = self.trajectory_model.name.removesuffix("_trajectory")
-                batch_evaluator = getattr(self.cost_function, f"evaluate_{model_prefix}_batch", None)
-            if batch_evaluator is None:
-                return np.asarray([objective(parameters) for parameters in parameters_batch], dtype=float)
-            try:
-                trajectory_batch = self.trajectory_model.decode_batch_arrays(parameters_batch, problem)
-                values = batch_evaluator(trajectory_batch, problem)
-                values = np.asarray(values, dtype=float).reshape(-1)
-                if values.shape == (parameters_batch.shape[0],):
-                    values[~np.isfinite(values)] = float("inf")
-                    return values
-            except Exception:
-                pass
-            return np.asarray([objective(parameters) for parameters in parameters_batch], dtype=float)
+                raise TypeError(
+                    f"Trajectory model {self.trajectory_model.name!r} does not implement decode_batch_arrays."
+                )
+            trajectory_batch = self.trajectory_model.decode_batch_arrays(parameters_batch, problem)
+            values = np.asarray(self.cost_function.evaluate_batch(trajectory_batch, problem), dtype=float).reshape(-1)
+            expected_shape = (parameters_batch.shape[0],)
+            if values.shape != expected_shape:
+                raise ValueError(f"Batch objective shape mismatch: got {values.shape}, expected {expected_shape}.")
+            if not np.all(np.isfinite(values)):
+                raise FloatingPointError("Vectorized parametric trajectory objective produced non-finite costs.")
+            return values
 
         objective_batch_fn = None
         objective_mode = str(self.config.objective_mode).lower()
-        if objective_mode not in {"auto", "vectorized", "scalar"}:
+        if objective_mode not in {"vectorized", "scalar"}:
             raise ValueError(f"Unsupported objective_mode: {self.config.objective_mode}")
-        if objective_mode != "scalar":
-            objective_batch_fn = objective_batch
+        objective_batch_fn = objective_batch if objective_mode == "vectorized" else None
 
         optimization_problem = OptimizationProblem(
             objective=objective,
@@ -112,13 +102,9 @@ class ParametricPlanner(Planner):
         best_trajectory, best_cost = self._decode_and_evaluate(optimization.best_position, problem)
         candidates = self._candidate_trajectories(optimization.population, optimization.values, problem)
 
-        status = "success"
-        if best_trajectory is None or best_cost is None:
-            status = "no_valid_trajectory"
-        elif not best_cost.feasible:
-            status = "infeasible_best"
+        status = "success" if best_cost.feasible else "infeasible_best"
 
-        if best_trajectory is not None and self.config.warm_start:
+        if self.config.warm_start:
             self._last_parameters = np.asarray(optimization.best_position, dtype=float).copy()
 
         return PlannerResult(
@@ -135,6 +121,8 @@ class ParametricPlanner(Planner):
                 "parameter_dim": int(self.trajectory_model.parameter_dim(problem)),
                 "objective_mode": objective_mode,
                 "objective_batch_enabled": objective_batch_fn is not None,
+                "warm_start_generator": self.warm_start_generator.name,
+                "warm_start_seed_count": int(seeds.shape[0]),
             },
         )
 
@@ -153,7 +141,10 @@ class ParametricPlanner(Planner):
             max_count=int(self.config.max_initial_anchors),
         )
         if not self.warm_start_generator.supports(context):
-            self.warm_start_generator = default_parametric_warm_start_generator()
+            raise ValueError(
+                f"Warm-start generator {self.warm_start_generator.name!r} does not support "
+                f"trajectory model {self.trajectory_model.name!r}."
+            )
         seeds = self.warm_start_generator.generate(context)
         if seeds.size == 0:
             raise ValueError(f"No valid seeds for trajectory model {self.trajectory_model.name}")
@@ -163,13 +154,9 @@ class ParametricPlanner(Planner):
         self,
         parameters: np.ndarray,
         problem: PlanningProblem,
-    ) -> tuple[Optional[Trajectory], Optional[CostResult]]:
-        try:
-            trajectory = self.trajectory_model.decode(parameters, problem)
-            cost = self.cost_function.evaluate(trajectory, problem)
-        except Exception:
-            return None, None
-        return trajectory, cost
+    ) -> tuple[Trajectory, CostResult]:
+        trajectory = self.trajectory_model.decode(parameters, problem)
+        return trajectory, self.cost_function.evaluate(trajectory, problem)
 
     def _candidate_trajectories(
         self,
@@ -192,10 +179,8 @@ class ParametricPlanner(Planner):
                 continue
             seen.add(key)
             trajectory, cost = self._decode_and_evaluate(parameters, problem)
-            if trajectory is None:
-                continue
             metadata = dict(trajectory.metadata)
-            metadata["candidate_cost"] = None if cost is None else float(cost.total)
+            metadata["candidate_cost"] = float(cost.total)
             trajectory.metadata = metadata
             candidates.append(trajectory)
         return candidates

@@ -1,0 +1,18 @@
+scenario:
+  type: unprotected_left_turn
+  horizon: 5.0
+  dt: 0.1
+  route_extent: 55.0
+  lane_offset: 1.8
+  road_half_width: 4.2
+  turn_entry_y: -5.0
+  ego_s: 18.0
+  ego_speed: 8.0
+  target_speed: 9.0
+  actors:
+    oncoming:
+      s: 28.0
+      s_v: 8.0
+    left_crossing:
+      s: 28.0
+      s_v: 7.5
